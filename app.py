@@ -23,7 +23,7 @@ if logo.exists():
     st.image(str(logo), width=240)
 st.title('🏭 Producción Inteligente CC')
 st.caption('Planificación financiera de producción · Cuarto Creciente')
-st.info('Proyectá cobranzas, analizá rentabilidad y administrá fórmulas de fabricación. El plan automático quedará disponible al incorporar pedidos y stock.')
+st.info('Proyectá cobranzas, analizá rentabilidad y administrá fórmulas y stock de productos terminados.')
 
 
 def clean(x):
@@ -600,3 +600,131 @@ with f3:
             st.caption(f'Se toman {usable} bultos completos por elaboración (rendimiento Bejerman {float(base["rendimiento_bejerman"]):.2f}). No se permiten elaboraciones parciales. Esta simulación no descuenta materias primas ni presupuesto.')
 
 st.warning('Importante: el historial de fórmulas usa una base SQLite local. En Streamlit Cloud puede perderse al reiniciar o redesplegar. Descargá respaldos y conectemos una base de datos persistente antes de usarlo como registro definitivo.')
+
+
+# ─── STOCK DE PRODUCTOS TERMINADOS: FOTOGRAFÍAS POR FECHA ───
+st.divider()
+st.header('📦 Stock e historial')
+st.caption('Stock expresado en bultos. Cada carga guarda una fotografía completa de las existencias; no se suman stocks de diferentes fechas.')
+
+def init_stock_db():
+    with sqlite3.connect(store_path()) as con:
+        con.execute('CREATE TABLE IF NOT EXISTS stock_cargas (id INTEGER PRIMARY KEY AUTOINCREMENT, fecha_stock TEXT NOT NULL, fecha_carga TEXT NOT NULL, archivo TEXT NOT NULL, firma TEXT UNIQUE NOT NULL, origen TEXT NOT NULL, observaciones TEXT)')
+        con.execute('CREATE TABLE IF NOT EXISTS stock_detalle (carga_id INTEGER NOT NULL, codigo TEXT NOT NULL, descripcion TEXT NOT NULL, bultos REAL NOT NULL, PRIMARY KEY(carga_id,codigo), FOREIGN KEY(carga_id) REFERENCES stock_cargas(id))')
+
+def parse_stock_excel(upload):
+    book=pd.ExcelFile(upload)
+    for sheet in book.sheet_names:
+        raw=pd.read_excel(book,sheet_name=sheet,header=None,dtype=object)
+        for i in range(min(len(raw),35)):
+            labels=[clean(v) for v in raw.iloc[i].tolist()]
+            code_col=next((j for j,v in enumerate(labels) if v in ('COD','CODIGO','COD.','ARTICULO')),None)
+            name_col=next((j for j,v in enumerate(labels) if v in ('DESCRIPCION','DESCRIPCIÓN','PRODUCTO','DETALLE')),None)
+            qty_col=next((j for j,v in enumerate(labels) if v in ('STOCK','EXISTENCIA','EXISTENCIAS','CANTIDAD')),None)
+            if None in (code_col,name_col,qty_col):continue
+            data=raw.iloc[i+1:,[code_col,name_col,qty_col]].copy()
+            data.columns=['codigo','descripcion','bultos']
+            data['codigo']=data['codigo'].apply(lambda v: str(v).strip().upper() if pd.notna(v) else '')
+            data['descripcion']=data['descripcion'].fillna('').astype(str).str.strip()
+            data['bultos']=data['bultos'].apply(parse_amount)
+            data=data[(data.codigo!='') & (data.descripcion!='') & data.bultos.notna()].copy()
+            data=data[~data.codigo.str.contains(r'^(TOTAL|SUBTOTAL|COD)$',case=False,regex=True)]
+            if data.empty:continue
+            if data.codigo.duplicated().any():
+                repeated=', '.join(data.loc[data.codigo.duplicated(),'codigo'].head(5))
+                raise ValueError(f'El archivo tiene códigos repetidos ({repeated}). Revisá el reporte antes de guardarlo.')
+            if (data.bultos<0).any():
+                st.warning('El archivo contiene stock negativo. Se conservará tal como figura en Bejerman y se marcará para revisión.')
+            return data.sort_values('codigo').reset_index(drop=True),sheet
+    raise ValueError('No encontré las columnas COD, DESCRIPCION y STOCK. Revisá que el archivo sea el reporte de stock de Bejerman.')
+
+def stock_snapshots():
+    with sqlite3.connect(store_path()) as con:
+        return pd.read_sql_query('SELECT * FROM stock_cargas ORDER BY fecha_stock DESC, id DESC',con)
+
+def stock_details(snapshot_id):
+    with sqlite3.connect(store_path()) as con:
+        return pd.read_sql_query('SELECT codigo,descripcion,bultos FROM stock_detalle WHERE carga_id=? ORDER BY codigo',con,params=(int(snapshot_id),))
+
+def save_stock(data,date_value,filename,origin='Excel',notes=''):
+    normalized=data.sort_values('codigo').copy()
+    payload=f"{date_value.isoformat()}\n"+normalized[['codigo','descripcion','bultos']].to_csv(index=False,float_format='%.6f')
+    fingerprint=hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    with sqlite3.connect(store_path()) as con:
+        if con.execute('SELECT 1 FROM stock_cargas WHERE firma=?',(fingerprint,)).fetchone():return None
+        cur=con.execute('INSERT INTO stock_cargas (fecha_stock,fecha_carga,archivo,firma,origen,observaciones) VALUES (?,?,?,?,?,?)',(date_value.isoformat(),datetime.now().isoformat(timespec='seconds'),filename,fingerprint,origin,notes))
+        con.executemany('INSERT INTO stock_detalle (carga_id,codigo,descripcion,bultos) VALUES (?,?,?,?)',[(cur.lastrowid,str(r.codigo),str(r.descripcion),float(r.bultos)) for r in normalized.itertuples(index=False)])
+        return cur.lastrowid
+
+init_stock_db()
+s1,s2,s3,s4=st.tabs(['📥 Cargar stock','📦 Stock actual','📊 Comparar fechas','📚 Historial y respaldo'])
+with s1:
+    st.info('Subí el reporte de productos terminados de Bejerman en formato .xlsx. La fecha representa cuándo se midió el stock, no cuándo se subió el archivo.')
+    stock_file=st.file_uploader('Excel de stock (.xlsx)',type=['xlsx'],key='stock_upload',help='Reporte de Bejerman con COD, DESCRIPCION y STOCK. Las cantidades están expresadas en bultos.')
+    stock_date=st.date_input('Fecha correspondiente al stock',value=datetime(2026,10,9).date(),key='stock_date',help='Elegí la fecha del reporte. Cada fecha puede tener distintas versiones si se corrige el stock.')
+    stock_notes=st.text_input('Observaciones (opcional)',key='stock_notes',help='Por ejemplo: cierre del día, recuento físico o ajuste del reporte.')
+    if stock_file is not None:
+        try:
+            preview,sheet=parse_stock_excel(stock_file)
+            c1,c2,c3=st.columns(3)
+            c1.metric('Productos',len(preview))
+            c2.metric('Con stock positivo',int((preview.bultos>0).sum()))
+            c3.metric('Bultos netos',f'{preview.bultos.sum():,.0f}'.replace(',','.'))
+            st.dataframe(preview.rename(columns={'codigo':'Código','descripcion':'Producto','bultos':'Stock (bultos)'}),hide_index=True,use_container_width=True)
+            if st.button('Guardar fotografía de stock',type='primary',key='stock_save',help='Guarda una nueva fotografía completa. Si ya existe exactamente la misma carga para esa fecha, no se duplica.'):
+                result=save_stock(preview,stock_date,stock_file.name,notes=stock_notes)
+                if result is None:st.info('Esta fotografía de stock ya estaba guardada para esa fecha. No se duplicó.')
+                else:st.success(f'Stock del {stock_date.strftime("%d/%m/%Y")} guardado como registro #{result}.')
+        except Exception as exc:st.error(f'No pude interpretar el Excel de stock: {exc}')
+with s2:
+    snaps=stock_snapshots()
+    if snaps.empty:st.info('Todavía no hay stock guardado. Cargá el primer Excel en la pestaña anterior.')
+    else:
+        latest=snaps.iloc[0]
+        current=stock_details(latest.id)
+        st.caption(f'Última fotografía: {pd.to_datetime(latest.fecha_stock).strftime("%d/%m/%Y")} · registro #{int(latest.id)} · {latest.archivo}')
+        a,b,c=st.columns(3)
+        a.metric('Productos',len(current))
+        b.metric('Con stock',int((current.bultos>0).sum()))
+        c.metric('Bultos netos',f'{current.bultos.sum():,.0f}'.replace(',','.'))
+        query=st.text_input('Buscar por código o producto',key='stock_search')
+        if query:
+            current=current[current.codigo.str.contains(query,case=False,regex=False)|current.descripcion.str.contains(query,case=False,regex=False)]
+        st.dataframe(current.rename(columns={'codigo':'Código','descripcion':'Producto','bultos':'Stock (bultos)'}),hide_index=True,use_container_width=True)
+        st.caption('El stock más reciente se selecciona por fecha del reporte, no por fecha de carga. Si existen varias versiones del mismo día, se utiliza la última guardada.')
+with s3:
+    snaps=stock_snapshots()
+    if len(snaps)<2:st.info('Cuando guardes al menos dos fotografías, podrás comparar los cambios de stock por producto.')
+    else:
+        labels={int(r.id):f'{pd.to_datetime(r.fecha_stock).strftime("%d/%m/%Y")} · registro #{int(r.id)}' for r in snaps.itertuples(index=False)}
+        options=list(labels)
+        a,b=st.columns(2)
+        older=a.selectbox('Fotografía anterior',options,index=1,format_func=lambda k:labels[k],key='stock_compare_old')
+        newer=b.selectbox('Fotografía posterior',options,index=0,format_func=lambda k:labels[k],key='stock_compare_new')
+        if older==newer:st.warning('Elegí dos fotografías diferentes.')
+        else:
+            old=stock_details(older).rename(columns={'bultos':'Stock anterior','descripcion':'Descripción anterior'})
+            new=stock_details(newer).rename(columns={'bultos':'Stock nuevo'})
+            comparison=old.merge(new,on='codigo',how='outer')
+            comparison['descripcion']=comparison['descripcion'].fillna(comparison['Descripción anterior'])
+            comparison['Stock anterior']=comparison['Stock anterior'].fillna(0)
+            comparison['Stock nuevo']=comparison['Stock nuevo'].fillna(0)
+            comparison['Diferencia']=comparison['Stock nuevo']-comparison['Stock anterior']
+            comparison=comparison[['codigo','descripcion','Stock anterior','Stock nuevo','Diferencia']].sort_values('Diferencia')
+            st.metric('Variación neta de bultos',f'{comparison.Diferencia.sum():+,.0f}'.replace(',','.'))
+            st.dataframe(comparison.rename(columns={'codigo':'Código','descripcion':'Producto'}),hide_index=True,use_container_width=True)
+            st.caption('La diferencia entre fechas no representa necesariamente ventas: también puede incluir producción, entregas, devoluciones y ajustes.')
+with s4:
+    snaps=stock_snapshots()
+    if snaps.empty:st.info('No hay registros guardados todavía.')
+    else:
+        st.dataframe(snaps[['id','fecha_stock','fecha_carga','archivo','origen','observaciones']].rename(columns={'id':'Registro','fecha_stock':'Fecha stock','fecha_carga':'Fecha carga','archivo':'Archivo','origen':'Origen','observaciones':'Observaciones'}),hide_index=True,use_container_width=True)
+        export=io.BytesIO()
+        with sqlite3.connect(store_path()) as con:
+            all_details=pd.read_sql_query('SELECT c.id AS registro,c.fecha_stock,d.codigo,d.descripcion,d.bultos FROM stock_cargas c JOIN stock_detalle d ON d.carga_id=c.id ORDER BY c.fecha_stock,c.id,d.codigo',con)
+        with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
+            snaps.to_excel(writer,sheet_name='Cargas',index=False)
+            all_details.to_excel(writer,sheet_name='Stock historico',index=False)
+        st.download_button('📥 Descargar historial de stock (Excel)',export.getvalue(),file_name='historial_stock_cc.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',help='Guardá este respaldo fuera de Streamlit: el historial local no es permanente.')
+        st.caption('Cada carga es una fotografía completa. Las versiones anteriores se conservan; no se reemplazan.')
+st.warning('⚠️ El historial de stock y fórmulas se guarda por ahora en SQLite local. Streamlit Cloud puede borrar esa información al reiniciar o redesplegar. Descargá respaldos y conectemos almacenamiento permanente antes de usarlo operativamente.')
