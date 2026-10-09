@@ -36,10 +36,17 @@ def normalize_client(x):
 
 
 def excel_date(series):
-    nums = pd.to_numeric(series, errors='coerce')
-    as_num = pd.to_datetime(nums, unit='D', origin='1899-12-30', errors='coerce')
-    as_text = pd.to_datetime(series.where(nums.isna()), errors='coerce', dayfirst=True)
-    return as_num.fillna(as_text).dt.normalize()
+    values = []
+    for v in series:
+        if pd.isna(v):
+            values.append(pd.NaT)
+        elif isinstance(v, (datetime, pd.Timestamp)):
+            values.append(pd.Timestamp(v).normalize())
+        elif isinstance(v, (int, float, np.integer, np.floating)):
+            values.append(pd.to_datetime(float(v),unit='D',origin='1899-12-30',errors='coerce'))
+        else:
+            values.append(pd.to_datetime(v,errors='coerce',dayfirst=True))
+    return pd.Series(values,index=series.index,dtype='datetime64[ns]')
 
 
 def parse_amount(value):
@@ -81,35 +88,69 @@ def payment_days(value):
 
 
 def read_historical(file):
+    """Importa cobros fechados del cash flow; nunca supone que IMPORTE ya se cobró."""
     book = pd.ExcelFile(file)
+    records = []
     for sheet in book.sheet_names:
         raw = pd.read_excel(book, sheet_name=sheet, header=None)
-        for i in range(min(20,len(raw))):
-            row = [clean(v) for v in raw.iloc[i].tolist()]
-            if 'CLIENTE' in row and 'IMPORTE' in row and ('FECHA ENTREGA' in row or 'FECHA' in row):
-                cols = {key: row.index(key) for key in ('CLIENTE','IMPORTE')}
-                cols['FECHA'] = row.index('FECHA ENTREGA') if 'FECHA ENTREGA' in row else row.index('FECHA')
-                data = raw.iloc[i+1:].copy()
-                out = pd.DataFrame({'FECHA ENTREGA': excel_date(data.iloc[:,cols['FECHA']]),
-                                    'CLIENTE':data.iloc[:,cols['CLIENTE']].astype('string').str.strip(),
-                                    'IMPORTE':pd.to_numeric(data.iloc[:,cols['IMPORTE']],errors='coerce')})
-                out = out.dropna(subset=['FECHA ENTREGA','CLIENTE','IMPORTE'])
-                out = out[(out.CLIENTE!='') & (out.IMPORTE>0)].copy()
-                out['CLAVE CLIENTE'] = out.CLIENTE.map(normalize_client)
-                # Fechas en columnas E en adelante; importes efectivamente cargados en celdas.
-                dates = []
-                for j in range(4, raw.shape[1]):
-                    d = excel_date(pd.Series([raw.iat[i,j]])).iloc[0]
-                    if pd.notna(d):
-                        dates.append((j,d))
-                records = []
-                for idx,r in out.iterrows():
-                    for j,d in dates:
-                        amount = pd.to_numeric(pd.Series([raw.iat[idx,j]]),errors='coerce').iloc[0]
-                        if pd.notna(amount) and amount>0:
-                            records.append({'CLAVE CLIENTE':r['CLAVE CLIENTE'], 'FECHA ENTREGA':r['FECHA ENTREGA'], 'FECHA COBRANZA':d,'IMPORTE COBRANZA':float(amount)})
-                return out.reset_index(drop=True), pd.DataFrame(records)
-    raise ValueError('No encontré FECHA ENTREGA, CLIENTE e IMPORTE en el flujo histórico.')
+        for i in range(min(25, len(raw))):
+            labels = [clean(v) for v in raw.iloc[i].tolist()]
+            if not ('CLIENTE' in labels and 'IMPORTE' in labels and
+                    ('FECHA ENTREGA' in labels or 'FECHA' in labels)):
+                continue
+            c = labels.index('CLIENTE'); a = labels.index('IMPORTE')
+            f = labels.index('FECHA ENTREGA') if 'FECHA ENTREGA' in labels else labels.index('FECHA')
+            date_columns = []
+            for j, v in enumerate(raw.iloc[i].tolist()):
+                if j in (c,a,f): continue
+                dt = pd.to_datetime(v, errors='coerce', dayfirst=True)
+                if pd.notna(dt) and pd.Timestamp('2020-01-01') <= dt <= pd.Timestamp('2045-12-31'):
+                    date_columns.append((j, pd.Timestamp(dt).normalize()))
+            for k in range(i+1, len(raw)):
+                row = raw.iloc[k]
+                client = row.iloc[c]
+                if pd.isna(client) or not str(client).strip(): continue
+                delivery = excel_date(pd.Series([row.iloc[f]])).iloc[0]
+                amount = parse_amount(row.iloc[a])
+                if pd.isna(delivery) or pd.isna(amount) or amount <= 0: continue
+                for j, date in date_columns:
+                    payment = parse_amount(row.iloc[j])
+                    if pd.notna(payment) and payment > 0:
+                        records.append({'FECHA ENTREGA': delivery, 'CLIENTE': str(client).strip(),
+                                        'IMPORTE VENTA': float(amount), 'FECHA COBRANZA': date,
+                                        'IMPORTE': float(payment), 'ORIGEN': 'CASH FLOW'})
+            break
+    if not records:
+        return pd.DataFrame(columns=['FECHA ENTREGA','CLIENTE','IMPORTE VENTA','FECHA COBRANZA','IMPORTE','ORIGEN'])
+    return pd.DataFrame(records)
+
+
+def build_forecast(routes, cashflow):
+    """Cash Flow tiene prioridad cuando una misma venta también aparece en rutas."""
+    parts = []
+    excluded = 0
+    if not cashflow.empty:
+        parts.append(cashflow.copy())
+    if not routes.empty:
+        rt = routes.copy()
+        rt['FECHA COBRANZA'] = rt['FECHA'] + pd.to_timedelta(rt['DÍAS DE PAGO'], unit='D')
+        rt = rt[rt['DÍAS DE PAGO'].notna() & rt['IMPORTE'].notna() & (rt['IMPORTE'] > 0)].copy()
+        rt['FECHA ENTREGA'] = rt['FECHA']
+        rt['IMPORTE VENTA'] = rt['IMPORTE']
+        rt['ORIGEN'] = 'HOJA DE RUTA'
+        if not cashflow.empty:
+            cf_keys = set(zip(cashflow['CLIENTE'].map(normalize_client),
+                              pd.to_datetime(cashflow['FECHA ENTREGA']).dt.strftime('%Y-%m-%d'),
+                              cashflow['IMPORTE VENTA'].round(2)))
+            duplicate = [ (normalize_client(r.CLIENTE),r._asdict()['FECHA ENTREGA'].strftime('%Y-%m-%d'),round(r._asdict()['IMPORTE VENTA'],2)) in cf_keys for r in rt.itertuples(index=False, name=None)] if False else [
+                (normalize_client(row['CLIENTE']), row['FECHA ENTREGA'].strftime('%Y-%m-%d'),round(float(row['IMPORTE VENTA']),2)) in cf_keys
+                for _,row in rt.iterrows()]
+            excluded = sum(duplicate)
+            rt = rt.loc[~pd.Series(duplicate,index=rt.index)]
+        parts.append(rt[['FECHA ENTREGA','CLIENTE','IMPORTE VENTA','FECHA COBRANZA','IMPORTE','ORIGEN']])
+    if not parts:
+        return pd.DataFrame(columns=['FECHA ENTREGA','CLIENTE','IMPORTE VENTA','FECHA COBRANZA','IMPORTE','ORIGEN']), excluded
+    return pd.concat(parts,ignore_index=True),excluded
 
 
 def money(v):
@@ -228,7 +269,7 @@ init_db()
 with st.sidebar:
     st.header('Archivos del cálculo')
     route_file=st.file_uploader('Hoja de ruta del día',type=['xlsx','xls'],help='Subí la hoja de ruta correspondiente al día que querés incorporar. Debe tener CLIENTE, IMPORTE y COBRAR (días). Si el libro contiene varios días, podrás elegir la pestaña.')
-    history_file=st.file_uploader('Cash Flow / flujo de cobranzas (.xlsx)',type=['xlsx','xls'],key='cash_flow',help='Subí el Excel de pedidos entregados y condiciones de pago. Se analiza por separado de las rutas para evitar sumar dos veces la misma venta.')
+    history_file=st.file_uploader('Cash Flow / flujo de cobranzas (.xlsx)',type=['xlsx','xls'],key='cash_flow',help='Subí el Excel con las fechas e importes de cobranzas. Se sumará a la proyección evitando operaciones repetidas con las hojas de ruta.')
     st.divider()
     st.header('Parámetros')
     initial_cash=st.number_input('Caja disponible inicial ($)',min_value=0.0,value=0.0,step=100000.0,help='Dinero que ya está disponible. No incluye ventas pendientes de cobro.')
@@ -236,7 +277,7 @@ with st.sidebar:
     horizon=st.selectbox('Horizonte de planificación',[7,15,30,60,90],index=2,format_func=lambda x:f'{x} días',help='Días a considerar desde la fecha inicial.')
     safety=st.number_input('Reserva de seguridad ($)',min_value=0.0,value=0.0,step=100000.0,help='Dinero que preferís no comprometer en producción.')
     reference_date=st.date_input('Fecha inicial de planificación',value=datetime.now().date(),format='DD/MM/YYYY',help='Fecha desde la cual se analizan las cobranzas proyectadas.')
-    st.caption('Los egresos se incorporarán más adelante.')
+    st.caption('Los egresos se incorporarán más adelante. Las cobranzas proyectadas no equivalen a dinero efectivamente recibido.')
 
 st.subheader('Indicadores financieros')
 indicators=st.empty()
@@ -279,58 +320,65 @@ if not saved.empty:
         batches.to_excel(writer,sheet_name='Hojas cargadas',index=False)
     st.download_button('📥 Descargar respaldo del historial',buff.getvalue(),file_name='produccion_cc_respaldo_historial.xlsx',help='Guardá este archivo fuera de Streamlit para no perder los datos si se reinicia la aplicación.')
 
-if st.button('🔎 Analizar cobranzas',type='primary',use_container_width=True,help='Calcula la proyección con las rutas guardadas y analiza el Cash Flow cargado por separado.'):
-    historical_data=pd.DataFrame();historical_payments=pd.DataFrame();historical_error=None
+if st.button('🔎 Analizar cobranzas', type='primary', use_container_width=True,
+             help='Proyecta los ingresos por fecha del Cash Flow y de las hojas de ruta, evitando operaciones repetidas.'):
+    error = None
+    cashflow = pd.DataFrame()
     if history_file is not None:
         try:
-            historical_data,historical_payments=read_historical(history_file)
+            cashflow = read_historical(history_file)
         except Exception as exc:
-            historical_error=str(exc)
-    st.session_state['analysis']=(saved.copy(),float(initial_cash),int(risk),int(horizon),float(safety),pd.Timestamp(reference_date),historical_data,historical_payments,historical_error)
+            error = str(exc)
+    if error:
+        st.error('No se pudo interpretar el Cash Flow: ' + error)
+    else:
+        forecast, excluded = build_forecast(saved, cashflow)
+        st.session_state['analysis'] = (forecast, excluded, float(initial_cash), int(risk),
+                                        int(horizon), float(safety), pd.Timestamp(reference_date))
 
 if 'analysis' in st.session_state:
-    route,cash,risk_used,horizon_used,reserve,start,history,payments,history_error=st.session_state['analysis']
-    if history_error:st.error('No se pudo leer el Cash Flow: '+history_error)
-    with st.expander('Cash Flow histórico de cobranzas',expanded=not history.empty):
-        st.caption('Se presenta por separado para no duplicar importes que también puedan figurar en las hojas de ruta. No se suma automáticamente al techo preliminar.')
-        if history.empty:
-            st.info('Para ver el Cash Flow, cargá su Excel en el panel izquierdo y presioná Analizar cobranzas.')
-        else:
-            a_hist,b_hist=st.columns(2)
-            a_hist.metric('Entregas en Cash Flow',len(history))
-            b_hist.metric('Cobranzas fechadas detectadas',len(payments))
-            st.dataframe(history,hide_index=True,use_container_width=True)
-            if not payments.empty:
-                st.dataframe(payments,hide_index=True,use_container_width=True)
-    if route.empty:
-        st.info('Todavía no hay hojas de ruta guardadas. Podés consultar el Cash Flow arriba; para proyectar rutas, guardá una hoja y volvé a analizar.')
+    forecast, excluded, cash, risk_used, horizon_used, reserve, start = st.session_state['analysis']
+    if forecast.empty:
+        st.warning('No encontramos cobranzas con fecha e importe. Cargá el Cash Flow o una hoja de ruta y presioná Analizar cobranzas.')
     else:
-        forecast=route.copy()
-        forecast['FECHA COBRANZA']=forecast['FECHA']+pd.to_timedelta(forecast['DÍAS DE PAGO'],unit='D')
-        forecast['COBRANZA AJUSTADA']=forecast['IMPORTE']*(1-risk_used/100)
-        forecast['ESTADO']=np.where(forecast['ESTADO CONDICIÓN'].eq('AUTOMÁTICA') & forecast['IMPORTE'].notna() & forecast['IMPORTE'].gt(0),'PROYECTABLE','REVISAR')
-        usable=forecast[(forecast['ESTADO']=='PROYECTABLE') & forecast['FECHA COBRANZA'].between(start,start+pd.Timedelta(days=horizon_used))]
-        expected=float(usable['IMPORTE'].sum());adjusted=float(usable['COBRANZA AJUSTADA'].sum())
-        budget=max(0,cash+adjusted-reserve)
+        forecast = forecast.copy()
+        forecast['FECHA COBRANZA'] = pd.to_datetime(forecast['FECHA COBRANZA'])
+        forecast['COBRANZA AJUSTADA'] = forecast['IMPORTE'] * (1-risk_used/100)
+        end = start + pd.Timedelta(days=horizon_used)
+        usable = forecast[forecast['FECHA COBRANZA'].between(start,end)].copy()
+        expected = float(usable['IMPORTE'].sum())
+        adjusted = float(usable['COBRANZA AJUSTADA'].sum())
+        budget = max(0, cash + adjusted - reserve)
         with indicators.container():
-            a,b,c,d=st.columns(4)
-            a.metric('Ventas registradas',money(float(route['IMPORTE'].sum())))
-            b.metric(f'Cobranzas ({horizon_used} días)',money(expected))
-            c.metric('Cobranzas ajustadas',money(adjusted))
-            d.metric('Techo preliminar',money(budget))
-        st.caption('El techo preliminar no descuenta proveedores, sueldos ni impuestos; no representa dinero libre para gastar.')
-        daily=usable.groupby('FECHA COBRANZA',as_index=False).agg(PREVISTO=('IMPORTE','sum'),AJUSTADO=('COBRANZA AJUSTADA','sum'))
-        if not daily.empty:st.bar_chart(daily.set_index('FECHA COBRANZA'))
-        else:st.info('No hay cobranzas proyectadas en el período seleccionado.')
-        t1,t2,t3=st.tabs(['Detalle de cobranzas','Resumen diario','Revisar condiciones'])
-        with t1:st.dataframe(forecast,hide_index=True,use_container_width=True)
-        with t2:st.dataframe(daily,hide_index=True,use_container_width=True)
-        with t3:st.dataframe(forecast[forecast['ESTADO']=='REVISAR'],hide_index=True,use_container_width=True)
-        output=io.BytesIO()
+            a,b,c,d = st.columns(4)
+            a.metric('Caja inicial', money(cash))
+            b.metric(f'Cobranzas ({horizon_used} días)', money(expected))
+            c.metric('Ingresos prudentes', money(adjusted))
+            d.metric('Techo preliminar', money(budget))
+        st.caption('La caja proyectada es una simulación: las cobranzas futuras no están confirmadas. No incluye pagos a proveedores, sueldos ni impuestos.')
+        if excluded:
+            st.info(f'Se excluyeron {excluded} operaciones de hojas de ruta porque ya estaban en el Cash Flow (mismo cliente, fecha de entrega e importe).')
+        st.subheader('Calendario de ingresos para planificar producción')
+        daily = usable.groupby('FECHA COBRANZA',as_index=False).agg(
+            COBRANZA_PREVISTA=('IMPORTE','sum'), COBRANZA_AJUSTADA=('COBRANZA AJUSTADA','sum'))
+        days = pd.DataFrame({'FECHA COBRANZA':pd.date_range(start,end,freq='D')})
+        daily = days.merge(daily,on='FECHA COBRANZA',how='left').fillna(0)
+        daily['CAJA PROYECTADA'] = cash + daily['COBRANZA_AJUSTADA'].cumsum()
+        daily['TECHO PRELIMINAR'] = (daily['CAJA PROYECTADA']-reserve).clip(lower=0)
+        st.line_chart(daily.set_index('FECHA COBRANZA')[['CAJA PROYECTADA','TECHO PRELIMINAR']])
+        t1,t2,t3 = st.tabs(['Ingresos por día','Detalle de cobranzas','Por origen'])
+        with t1: st.dataframe(daily,hide_index=True,use_container_width=True)
+        with t2: st.dataframe(usable.sort_values('FECHA COBRANZA'),hide_index=True,use_container_width=True)
+        with t3:
+            st.dataframe(usable.groupby('ORIGEN',as_index=False).agg(COBRANZA=('IMPORTE','sum'),OPERACIONES=('IMPORTE','size')),hide_index=True,use_container_width=True)
+        output = io.BytesIO()
         with pd.ExcelWriter(output,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as writer:
-            forecast.to_excel(writer,sheet_name='Proyeccion cobranzas',index=False)
-            daily.to_excel(writer,sheet_name='Resumen diario',index=False)
-            pd.DataFrame({'CONCEPTO':['Caja inicial','Cobranzas ajustadas','Reserva','Techo preliminar'],'IMPORTE':[cash,adjusted,reserve,budget]}).to_excel(writer,sheet_name='Resumen financiero',index=False)
-        st.download_button('📥 Descargar análisis en Excel',output.getvalue(),file_name='produccion_cc_analisis.xlsx',help='Exporta el análisis y el calendario de cobranzas calculado.')
+            daily.to_excel(writer,sheet_name='Calendario ingresos',index=False)
+            forecast.to_excel(writer,sheet_name='Todas las cobranzas',index=False)
+            pd.DataFrame({'CONCEPTO':['Caja inicial','Ingresos previstos','Ingresos prudentes','Reserva','Techo preliminar'],
+                          'IMPORTE':[cash,expected,adjusted,reserve,budget]}).to_excel(writer,sheet_name='Resumen financiero',index=False)
+        st.download_button('📥 Descargar proyección de ingresos',output.getvalue(),
+                           file_name='produccion_cc_proyeccion_ingresos.xlsx',
+                           help='Descarga las fechas, importes y caja acumulada para planificar producción.')
 else:
-    st.info('Cargá y guardá una hoja de ruta; después presioná **Analizar cobranzas**.')
+    st.info('Cargá el Cash Flow y/o guardá una hoja de ruta. Después presioná **Analizar cobranzas**.')
