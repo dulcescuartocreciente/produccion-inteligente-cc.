@@ -80,6 +80,38 @@ def payment_days(value):
 
 
 
+def read_historical(file):
+    book = pd.ExcelFile(file)
+    for sheet in book.sheet_names:
+        raw = pd.read_excel(book, sheet_name=sheet, header=None)
+        for i in range(min(20,len(raw))):
+            row = [clean(v) for v in raw.iloc[i].tolist()]
+            if 'CLIENTE' in row and 'IMPORTE' in row and ('FECHA ENTREGA' in row or 'FECHA' in row):
+                cols = {key: row.index(key) for key in ('CLIENTE','IMPORTE')}
+                cols['FECHA'] = row.index('FECHA ENTREGA') if 'FECHA ENTREGA' in row else row.index('FECHA')
+                data = raw.iloc[i+1:].copy()
+                out = pd.DataFrame({'FECHA ENTREGA': excel_date(data.iloc[:,cols['FECHA']]),
+                                    'CLIENTE':data.iloc[:,cols['CLIENTE']].astype('string').str.strip(),
+                                    'IMPORTE':pd.to_numeric(data.iloc[:,cols['IMPORTE']],errors='coerce')})
+                out = out.dropna(subset=['FECHA ENTREGA','CLIENTE','IMPORTE'])
+                out = out[(out.CLIENTE!='') & (out.IMPORTE>0)].copy()
+                out['CLAVE CLIENTE'] = out.CLIENTE.map(normalize_client)
+                # Fechas en columnas E en adelante; importes efectivamente cargados en celdas.
+                dates = []
+                for j in range(4, raw.shape[1]):
+                    d = excel_date(pd.Series([raw.iat[i,j]])).iloc[0]
+                    if pd.notna(d):
+                        dates.append((j,d))
+                records = []
+                for idx,r in out.iterrows():
+                    for j,d in dates:
+                        amount = pd.to_numeric(pd.Series([raw.iat[idx,j]]),errors='coerce').iloc[0]
+                        if pd.notna(amount) and amount>0:
+                            records.append({'CLAVE CLIENTE':r['CLAVE CLIENTE'], 'FECHA ENTREGA':r['FECHA ENTREGA'], 'FECHA COBRANZA':d,'IMPORTE COBRANZA':float(amount)})
+                return out.reset_index(drop=True), pd.DataFrame(records)
+    raise ValueError('No encontré FECHA ENTREGA, CLIENTE e IMPORTE en el flujo histórico.')
+
+
 def money(v):
     return "$ " + f"{v:,.0f}".replace(",", ".")
 
@@ -196,6 +228,7 @@ init_db()
 with st.sidebar:
     st.header('Archivos del cálculo')
     route_file=st.file_uploader('Hoja de ruta del día',type=['xlsx','xls'],help='Subí la hoja de ruta correspondiente al día que querés incorporar. Debe tener CLIENTE, IMPORTE y COBRAR (días). Si el libro contiene varios días, podrás elegir la pestaña.')
+    history_file=st.file_uploader('Cash Flow / flujo de cobranzas (.xlsx)',type=['xlsx','xls'],key='cash_flow',help='Subí el Excel de pedidos entregados y condiciones de pago. Se analiza por separado de las rutas para evitar sumar dos veces la misma venta.')
     st.divider()
     st.header('Parámetros')
     initial_cash=st.number_input('Caja disponible inicial ($)',min_value=0.0,value=0.0,step=100000.0,help='Dinero que ya está disponible. No incluye ventas pendientes de cobro.')
@@ -216,7 +249,7 @@ if route_file:
     try:
         candidates=read_route(route_file)
         names=[x[0] for x in candidates]
-        selected=st.selectbox('Día / pestaña a incorporar',names,help='Seleccioná solo la pestaña del día que querés guardar. Las demás no se importan.') if len(names)>1 else names[0]
+        selected=st.selectbox('Día / pestaña a incorporar',names,index=names.index('9102026') if '9102026' in names else 0,help='Elegí la pestaña de la hoja de ruta que querés cargar. El sistema reconoce también la hoja 9102026.') if len(names)>1 else names[0]
         raw=next(x[1] for x in candidates if x[0]==selected)
         fallback=st.date_input('Fecha de entrega de esta hoja',value=datetime.now().date(),format='DD/MM/YYYY',help='Se usa si la fecha no puede identificarse a partir del nombre de la pestaña.')
         preview=extract_route(selected,raw,fallback)
@@ -246,13 +279,31 @@ if not saved.empty:
         batches.to_excel(writer,sheet_name='Hojas cargadas',index=False)
     st.download_button('📥 Descargar respaldo del historial',buff.getvalue(),file_name='produccion_cc_respaldo_historial.xlsx',help='Guardá este archivo fuera de Streamlit para no perder los datos si se reinicia la aplicación.')
 
-if st.button('🔎 Analizar cobranzas',type='primary',use_container_width=True,help='Calcula la proyección con todas las hojas de ruta que ya están guardadas y los parámetros actuales.'):
-    st.session_state['analysis']=(saved.copy(),float(initial_cash),int(risk),int(horizon),float(safety),pd.Timestamp(reference_date))
+if st.button('🔎 Analizar cobranzas',type='primary',use_container_width=True,help='Calcula la proyección con las rutas guardadas y analiza el Cash Flow cargado por separado.'):
+    historical_data=pd.DataFrame();historical_payments=pd.DataFrame();historical_error=None
+    if history_file is not None:
+        try:
+            historical_data,historical_payments=read_historical(history_file)
+        except Exception as exc:
+            historical_error=str(exc)
+    st.session_state['analysis']=(saved.copy(),float(initial_cash),int(risk),int(horizon),float(safety),pd.Timestamp(reference_date),historical_data,historical_payments,historical_error)
 
 if 'analysis' in st.session_state:
-    route,cash,risk_used,horizon_used,reserve,start=st.session_state['analysis']
+    route,cash,risk_used,horizon_used,reserve,start,history,payments,history_error=st.session_state['analysis']
+    if history_error:st.error('No se pudo leer el Cash Flow: '+history_error)
+    with st.expander('Cash Flow histórico de cobranzas',expanded=not history.empty):
+        st.caption('Se presenta por separado para no duplicar importes que también puedan figurar en las hojas de ruta. No se suma automáticamente al techo preliminar.')
+        if history.empty:
+            st.info('Para ver el Cash Flow, cargá su Excel en el panel izquierdo y presioná Analizar cobranzas.')
+        else:
+            a_hist,b_hist=st.columns(2)
+            a_hist.metric('Entregas en Cash Flow',len(history))
+            b_hist.metric('Cobranzas fechadas detectadas',len(payments))
+            st.dataframe(history,hide_index=True,use_container_width=True)
+            if not payments.empty:
+                st.dataframe(payments,hide_index=True,use_container_width=True)
     if route.empty:
-        st.info('Primero guardá una hoja de ruta para poder analizar cobranzas.')
+        st.info('Todavía no hay hojas de ruta guardadas. Podés consultar el Cash Flow arriba; para proyectar rutas, guardá una hoja y volvé a analizar.')
     else:
         forecast=route.copy()
         forecast['FECHA COBRANZA']=forecast['FECHA']+pd.to_timedelta(forecast['DÍAS DE PAGO'],unit='D')
