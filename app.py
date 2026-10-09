@@ -270,6 +270,7 @@ with st.sidebar:
     st.header('Archivos del cálculo')
     route_file=st.file_uploader('Hoja de ruta del día',type=['xlsx','xls'],help='Subí la hoja de ruta correspondiente al día que querés incorporar. Debe tener CLIENTE, IMPORTE y COBRAR (días). Si el libro contiene varios días, podrás elegir la pestaña.')
     history_file=st.file_uploader('Cash Flow / flujo de cobranzas (.xlsx)',type=['xlsx','xls'],key='cash_flow',help='Subí el Excel con las fechas e importes de cobranzas. Se sumará a la proyección evitando operaciones repetidas con las hojas de ruta.')
+    profitability_file=st.file_uploader('Costos, márgenes y precios por bulto (.xlsx)',type=['xlsx','xls'],key='profitability',help='Subí el Excel con las columnas Artic.-Conc., COSTO2, MARGEN y precio. Los costos cero quedan excluidos de la simulación.')
     st.divider()
     st.header('Parámetros')
     initial_cash=st.number_input('Caja disponible inicial ($)',min_value=0.0,value=0.0,step=100000.0,help='Dinero que ya está disponible. No incluye ventas pendientes de cobro.')
@@ -382,3 +383,83 @@ if 'analysis' in st.session_state:
                            help='Descarga las fechas, importes y caja acumulada para planificar producción.')
 else:
     st.info('Cargá el Cash Flow y/o guardá una hoja de ruta. Después presioná **Analizar cobranzas**.')
+
+
+st.divider()
+st.header('📊 Rentabilidad y planificación de producción')
+st.caption('Esta etapa cruza costos por bulto con el presupuesto preliminar de cobranzas. Todavía no considera pedidos pendientes, stock, egresos, capacidad productiva ni plazos de fabricación.')
+
+def read_profitability(upload):
+    df = pd.read_excel(upload, sheet_name=0)
+    colmap = {str(c).strip().lower(): c for c in df.columns}
+    required = ['artic.-conc.', 'costo2', 'margen', 'precio']
+    missing = [x for x in required if x not in colmap]
+    if missing:
+        raise ValueError('Faltan columnas: ' + ', '.join(missing) + '. Se esperan Artic.-Conc., COSTO2, MARGEN y precio.')
+    result = df[[colmap[x] for x in required]].copy()
+    result.columns = ['PRODUCTO', 'COSTO POR BULTO', 'MARGEN INFORMADO', 'PRECIO POR BULTO']
+    result['PRODUCTO'] = result['PRODUCTO'].astype(str).str.strip()
+    for col in ['COSTO POR BULTO', 'MARGEN INFORMADO', 'PRECIO POR BULTO']:
+        result[col] = pd.to_numeric(result[col], errors='coerce')
+    result = result[(result['PRODUCTO'] != '') & (result['PRODUCTO'].str.lower() != 'nan')].copy()
+    result['GANANCIA POR BULTO'] = result['PRECIO POR BULTO'] - result['COSTO POR BULTO']
+    result['MARGEN CALCULADO (%)'] = 100 * result['GANANCIA POR BULTO'] / result['PRECIO POR BULTO'].where(result['PRECIO POR BULTO'] > 0)
+    result['ESTADO'] = 'Válido'
+    result.loc[result['COSTO POR BULTO'].isna() | (result['COSTO POR BULTO'] <= 0), 'ESTADO'] = 'Revisar costo'
+    result.loc[result['PRECIO POR BULTO'].isna() | (result['PRECIO POR BULTO'] <= 0), 'ESTADO'] = 'Revisar precio'
+    result.loc[(result['ESTADO'] == 'Válido') & (result['GANANCIA POR BULTO'] <= 0), 'ESTADO'] = 'Sin margen positivo'
+    return result
+
+if profitability_file is None:
+    st.info('Subí el Excel de costos, márgenes y precios para comparar productos y simular la fabricación.')
+else:
+    try:
+        profitability = read_profitability(profitability_file)
+        valid = profitability[profitability['ESTADO'] == 'Válido'].copy()
+        p1,p2,p3 = st.columns(3)
+        p1.metric('Productos registrados', str(len(profitability)))
+        p2.metric('Productos con costo válido', str(len(valid)))
+        p3.metric('Productos para revisar', str(len(profitability)-len(valid)))
+        if len(valid) < len(profitability):
+            st.warning('Los productos sin costo positivo, precio válido o margen positivo no se utilizan en la simulación. No se supone que su fabricación sea gratuita.')
+        st.dataframe(profitability, use_container_width=True, hide_index=True,
+                     column_config={'MARGEN INFORMADO': st.column_config.NumberColumn('Margen informado',format='%.2f'),
+                                    'MARGEN CALCULADO (%)': st.column_config.NumberColumn('Margen calculado (%)',format='%.2f')})
+        st.subheader('Simulación por producto')
+        st.caption('Elegí un producto y una cantidad. Se calcula el capital necesario y la ganancia potencial si se venden todos los bultos. No es una orden de fabricación.')
+        if not valid.empty:
+            chosen = st.selectbox('Producto a simular', valid['PRODUCTO'].tolist(), key='sim_product', help='Solo aparecen productos con costo y precio válidos y ganancia positiva.')
+            qty = st.number_input('Bultos a fabricar (simulación)', min_value=0, max_value=1000000, value=100, step=10,
+                                  help='Cantidad hipotética. Cuando carguemos pedidos y stock, usaremos la necesidad real.')
+            item = valid[valid['PRODUCTO'] == chosen].iloc[0]
+            investment = float(qty) * float(item['COSTO POR BULTO'])
+            potential_sales = float(qty) * float(item['PRECIO POR BULTO'])
+            potential_profit = potential_sales - investment
+            s1,s2,s3 = st.columns(3)
+            s1.metric('Inversión requerida', money(investment))
+            s2.metric('Venta potencial', money(potential_sales))
+            s3.metric('Ganancia bruta potencial', money(potential_profit))
+            if 'analysis' in st.session_state:
+                fc,exc,cc,rr,hh,res,start = st.session_state['analysis']
+                fc = fc.copy()
+                fc['FECHA COBRANZA'] = pd.to_datetime(fc['FECHA COBRANZA'])
+                horizon_end = start + pd.Timedelta(days=hh)
+                within = fc[fc['FECHA COBRANZA'].between(start,horizon_end)]
+                available = max(0.0, cc + float(within['IMPORTE'].sum()) * (1-rr/100) - res)
+                st.metric('Presupuesto preliminar según cobranzas', money(available))
+                if investment > available:
+                    st.warning('Esta simulación supera el presupuesto preliminar de fabricación calculado con las cobranzas.')
+                else:
+                    st.success('Esta simulación entra en el presupuesto preliminar, antes de descontar egresos y otras obligaciones.')
+                if float(item['COSTO POR BULTO']) > 0:
+                    st.caption(f'Con ese presupuesto, el máximo teórico de este producto sería {int(available // float(item["COSTO POR BULTO"])):,} bultos, sin fabricar otros productos ni considerar demanda.'.replace(',', '.'))
+            else:
+                st.info('Presioná «Analizar cobranzas» arriba para comparar esta inversión con el dinero proyectado.')
+        output_profit = io.BytesIO()
+        with pd.ExcelWriter(output_profit, engine='xlsxwriter') as writer:
+            profitability.to_excel(writer, sheet_name='Rentabilidad por bulto', index=False)
+        st.download_button('📥 Descargar análisis de rentabilidad', output_profit.getvalue(),
+                           file_name='produccion_cc_rentabilidad.xlsx',
+                           help='Exporta costos, precios, márgenes calculados y advertencias de validación.')
+    except Exception as exc:
+        st.error('No se pudo interpretar el Excel de rentabilidad: ' + str(exc))
