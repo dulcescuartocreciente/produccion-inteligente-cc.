@@ -23,7 +23,7 @@ if logo.exists():
     st.image(str(logo), width=240)
 st.title('🏭 Producción Inteligente CC')
 st.caption('Planificación financiera de producción · Cuarto Creciente')
-st.info('Esta primera etapa proyecta cobranzas y recursos estimados. Todavía no recomienda productos a fabricar: para eso incorporaremos costos, demanda, insumos y capacidad.')
+st.info('Proyectá cobranzas, analizá rentabilidad y administrá fórmulas de fabricación. El plan automático quedará disponible al incorporar pedidos y stock.')
 
 
 def clean(x):
@@ -463,3 +463,140 @@ else:
                            help='Exporta costos, precios, márgenes calculados y advertencias de validación.')
     except Exception as exc:
         st.error('No se pudo interpretar el Excel de rentabilidad: ' + str(exc))
+
+
+st.divider()
+st.header('🧪 Fórmulas y rendimientos')
+st.caption('El plan utiliza el rendimiento Bejerman (incluye merma). Solo se admiten elaboraciones completas. Cada edición genera una versión nueva y conserva las anteriores.')
+
+def formulas_db():
+    with sqlite3.connect(store_path()) as con:
+        con.execute('CREATE TABLE IF NOT EXISTS formulas (codigo TEXT, version INTEGER, producto TEXT, rendimiento_bejerman REAL, rendimiento_teorico REAL, observaciones TEXT, creado TEXT, origen TEXT, PRIMARY KEY(codigo,version))')
+        con.execute('CREATE TABLE IF NOT EXISTS formula_ingredientes (codigo TEXT, version INTEGER, posicion INTEGER, grupo TEXT, ingrediente TEXT, cantidad REAL, unidad TEXT, brix REAL, PRIMARY KEY(codigo,version,posicion))')
+
+def formula_versions():
+    with sqlite3.connect(store_path()) as con:
+        return pd.read_sql_query('SELECT * FROM formulas ORDER BY producto,version DESC',con)
+
+def formula_ingredients(code,version):
+    with sqlite3.connect(store_path()) as con:
+        return pd.read_sql_query('SELECT grupo,ingrediente,cantidad,unidad,brix FROM formula_ingredientes WHERE codigo=? AND version=? ORDER BY posicion',con,params=(code,int(version)))
+
+def save_formula(code,product,bejerman,theoretical,notes,ingredients,origin):
+    code=str(code).strip().upper();product=str(product).strip()
+    if not code or not product: raise ValueError('Completá el código y el nombre del producto.')
+    if not np.isfinite(bejerman) or bejerman<=0: raise ValueError('El rendimiento Bejerman debe ser mayor que cero.')
+    if ingredients.empty: raise ValueError('La fórmula debe tener ingredientes.')
+    data=[]
+    for _,r in ingredients.iterrows():
+        name=str(r.get('ingrediente','')).strip()
+        if not name or name.lower()=='nan': continue
+        qty=pd.to_numeric(r.get('cantidad'),errors='coerce')
+        if pd.isna(qty) or qty<0: raise ValueError('Revisá las cantidades: deben ser números no negativos.')
+        brix=pd.to_numeric(r.get('brix'),errors='coerce')
+        data.append((str(r.get('grupo','') or ''),name,float(qty),str(r.get('unidad','') or ''),None if pd.isna(brix) else float(brix)))
+    if not data: raise ValueError('No hay ingredientes válidos.')
+    with sqlite3.connect(store_path()) as con:
+        last=con.execute('SELECT MAX(version) FROM formulas WHERE codigo=?',(code,)).fetchone()[0]
+        version=1 if last is None else last+1
+        con.execute('INSERT INTO formulas VALUES (?,?,?,?,?,?,?,?)',(code,version,product,float(bejerman),None if pd.isna(theoretical) else float(theoretical),notes,datetime.now().isoformat(timespec='seconds'),origin))
+        con.executemany('INSERT INTO formula_ingredientes VALUES (?,?,?,?,?,?,?,?)',[(code,version,i,*r) for i,r in enumerate(data)])
+    return version
+
+def parse_formula_excel(upload):
+    book=pd.ExcelFile(upload)
+    raw=pd.read_excel(book,sheet_name=0,header=None)
+    def cell(r,c):
+        return raw.iat[r,c] if r<len(raw) and c<len(raw.columns) else None
+    code=None;name=None;revision=None;bej=None;theo=None;items=[];in_table=False;group=''
+    for i in range(len(raw)):
+        vals=[clean(v) if pd.notna(v) else '' for v in raw.iloc[i].tolist()]
+        if 'VERSION' in vals and 'CODIGO' in vals:
+            revision=cell(i+1,vals.index('VERSION'));code=cell(i+1,vals.index('CODIGO'))
+        if any('MERMELADA' in v or 'JUGO' in v or 'DULCE' in v for v in vals[:2]) and name is None:
+            name=cell(i,0)
+        label=vals[0] if vals else ''
+        if 'RENDIMIENTO BEJERMAN' in label:bej=pd.to_numeric(cell(i,2),errors='coerce')
+        if label=='RENDIMIENTO TEORICO':theo=pd.to_numeric(cell(i,2),errors='coerce')
+        if len(vals)>3 and vals[1]=='INGREDIENTE' and vals[2]=='CANTIDAD':in_table=True;continue
+        if in_table:
+            if 'MASA TOTAL' in label or 'DATOS FISICOQUIMICOS' in label:in_table=False;continue
+            ingredient=cell(i,1);qty=pd.to_numeric(cell(i,2),errors='coerce')
+            if pd.notna(cell(i,0)) and str(cell(i,0)).strip():group=str(cell(i,0)).strip()
+            if pd.notna(ingredient) and str(ingredient).strip() and pd.notna(qty):
+                brix=pd.to_numeric(cell(i,4),errors='coerce')
+                items.append({'grupo':group,'ingrediente':str(ingredient).strip(),'cantidad':float(qty),'unidad':str(cell(i,3) or ''),'brix':None if pd.isna(brix) else float(brix)})
+    if not code or pd.isna(bej) or not items:
+        raise ValueError('No pude encontrar código, rendimiento Bejerman e ingredientes. Revisá que el archivo tenga el formato del modelo.')
+    return {'codigo':str(code).strip(),'producto':str(name or code).strip(),'revision_original':revision,'bejerman':float(bej),'teorico':float(theo) if pd.notna(theo) else 0.,'ingredientes':pd.DataFrame(items)}
+
+formulas_db()
+f1,f2,f3=st.tabs(['📥 Importar fórmula','📚 Fórmulas e historial','✏️ Editar y simular'])
+with f1:
+    formula_file=st.file_uploader('Subir fórmula de elaboración (.xlsx)',type=['xlsx','xls'],key='formula_upload',help='Subí un Excel de fórmula como el modelo de Mermelada Stevia Arándano. Se leerán ingredientes, código y rendimiento Bejerman.')
+    if formula_file:
+        try:
+            parsed=parse_formula_excel(formula_file)
+            st.write(f"**{parsed['producto']}** · Código {parsed['codigo']} · Revisión del Excel: {parsed['revision_original']}")
+            x,y=st.columns(2)
+            x.metric('Rendimiento Bejerman (packs)',f"{parsed['bejerman']:,.2f}")
+            y.metric('Rendimiento teórico (packs)',f"{parsed['teorico']:,.2f}")
+            st.dataframe(parsed['ingredientes'],hide_index=True,use_container_width=True)
+            import_note=st.text_input('Observaciones de importación',key='formula_import_note',help='Anotá el motivo de la carga o la revisión de la fórmula.')
+            if st.button('Guardar fórmula como nueva versión',type='primary',key='formula_import_save'):
+                version=save_formula(parsed['codigo'],parsed['producto'],parsed['bejerman'],parsed['teorico'],import_note,parsed['ingredientes'],f'Excel: {formula_file.name}; revisión origen {parsed["revision_original"]}')
+                st.success(f'Fórmula guardada. Versión interna {version}. Se conservaron las versiones anteriores.')
+        except Exception as exc:st.error('No se pudo importar la fórmula: '+str(exc))
+with f2:
+    versions=formula_versions()
+    if versions.empty:st.info('Todavía no hay fórmulas guardadas. Importá la primera desde Excel.')
+    else:
+        latest=versions.sort_values('version').drop_duplicates('codigo',keep='last')
+        st.subheader('Fórmulas vigentes')
+        st.dataframe(latest[['codigo','producto','version','rendimiento_bejerman','rendimiento_teorico','creado']],hide_index=True,use_container_width=True)
+        st.subheader('Historial de revisiones')
+        st.dataframe(versions[['codigo','producto','version','rendimiento_bejerman','observaciones','creado','origen']],hide_index=True,use_container_width=True)
+        export=io.BytesIO()
+        with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
+            versions.to_excel(writer,sheet_name='Versiones',index=False)
+            with sqlite3.connect(store_path()) as con:
+                pd.read_sql_query('SELECT * FROM formula_ingredientes',con).to_excel(writer,sheet_name='Ingredientes',index=False)
+        st.download_button('📥 Descargar respaldo de fórmulas',export.getvalue(),file_name='respaldo_formulas_cc.xlsx',help='Guardá una copia externa: el almacenamiento local de Streamlit Cloud puede perderse al reiniciar.')
+with f3:
+    versions=formula_versions()
+    if versions.empty:st.info('Importá una fórmula para habilitar su edición y simulación.')
+    else:
+        options=versions.sort_values('version').drop_duplicates('codigo',keep='last')
+        selected_code=st.selectbox('Producto / código',options['codigo'].tolist(),format_func=lambda c:f"{options.loc[options.codigo==c,'producto'].iloc[0]} ({c})",key='formula_code')
+        relevant=versions[versions.codigo==selected_code]
+        chosen_version=st.selectbox('Versión para consultar o editar',relevant.version.tolist(),key='formula_version')
+        base=relevant[relevant.version==chosen_version].iloc[0]
+        ingredients=formula_ingredients(selected_code,chosen_version)
+        with st.form('formula_edit_form'):
+            new_product=st.text_input('Nombre del producto',value=base['producto'])
+            new_bej=st.number_input('Rendimiento Bejerman (packs por elaboración)',min_value=0.01,value=float(base['rendimiento_bejerman']),format='%.4f',help='Rendimiento con merma. Es el utilizado para calcular elaboraciones completas.')
+            new_theo=st.number_input('Rendimiento teórico (referencia)',min_value=0.0,value=float(base['rendimiento_teorico'] or 0),format='%.4f')
+            edited=st.data_editor(ingredients,num_rows='dynamic',hide_index=True,use_container_width=True,key=f'edit_{selected_code}_{chosen_version}',column_config={'cantidad':st.column_config.NumberColumn('Cantidad',min_value=0),'ingrediente':st.column_config.TextColumn('Ingrediente',required=True)})
+            edit_note=st.text_input('Motivo del cambio / observaciones',help='El historial conserva esta nota junto con la fecha de la nueva versión.')
+            submitted=st.form_submit_button('Guardar cambios como nueva versión',type='primary')
+        if submitted:
+            try:
+                if not edit_note.strip():raise ValueError('Indicá el motivo de la modificación para conservar la trazabilidad.')
+                new_ver=save_formula(selected_code,new_product,new_bej,new_theo,edit_note,edited,f'Edición de versión {chosen_version}')
+                st.success(f'Nueva versión {new_ver} guardada. La versión {chosen_version} permanece en el historial.')
+            except Exception as exc:st.error(str(exc))
+        st.subheader('Simular necesidad de elaboraciones completas')
+        demand=st.number_input('Bultos necesarios (después de descontar stock)',min_value=0,max_value=1000000,value=150,step=1,key='formula_demand')
+        # Se descartan fracciones: no se pueden despachar packs incompletos.
+        usable=int(np.floor(float(base['rendimiento_bejerman'])))
+        if usable<1:st.warning('El rendimiento Bejerman es menor a un bulto completo. Revisá la unidad de medida.')
+        else:
+            batches=int(np.ceil(demand/usable))
+            produced=batches*usable
+            a,b,c=st.columns(3)
+            a.metric('Elaboraciones completas',str(batches))
+            b.metric('Bultos utilizables',str(produced))
+            c.metric('Excedente estimado',str(produced-demand))
+            st.caption(f'Se toman {usable} bultos completos por elaboración (rendimiento Bejerman {float(base["rendimiento_bejerman"]):.2f}). No se permiten elaboraciones parciales. Esta simulación no descuenta materias primas ni presupuesto.')
+
+st.warning('Importante: el historial de fórmulas usa una base SQLite local. En Streamlit Cloud puede perderse al reiniciar o redesplegar. Descargá respaldos y conectemos una base de datos persistente antes de usarlo como registro definitivo.')
