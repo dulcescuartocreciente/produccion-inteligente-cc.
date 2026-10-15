@@ -1,4 +1,6 @@
 import io
+import calendar
+import html
 import hashlib
 import sqlite3
 import re
@@ -11,19 +13,31 @@ import streamlit as st
 
 st.set_page_config(page_title='Producción Inteligente CC', page_icon='🏭', layout='wide')
 st.markdown('''<style>
-.block-container{padding-top:1.3rem;max-width:1300px}
-[data-testid="stMetric"]{background:#f1f8fd;border:1px solid #d8e9f6;border-radius:12px;padding:9px 10px;min-width:0}
-[data-testid="stMetricLabel"]{color:#24445c}
-[data-testid="stMetricValue"]{font-size:clamp(1rem,1.5vw,1.4rem)!important;overflow-wrap:anywhere;line-height:1.25}
-[data-testid="stMetricLabel"]{font-size:.78rem!important}
+.block-container{padding-top:1rem;max-width:1480px;padding-bottom:3rem}
+[data-testid="stMetric"]{background:#f1f8fd;border:1px solid #d8e9f6;border-radius:12px;padding:10px;min-width:0}
+[data-testid="stMetricLabel"]{font-size:.79rem!important;color:#24445c}
+[data-testid="stMetricValue"]{font-size:clamp(.94rem,1.35vw,1.3rem)!important;overflow-wrap:anywhere;line-height:1.25}
 h1,h2,h3{color:#175d8b}
+.stTabs [data-baseweb="tab-list"]{gap:.35rem;flex-wrap:wrap;background:#eef6fc;border-radius:12px;padding:.35rem}
+.stTabs [data-baseweb="tab"]{border-radius:9px;padding:.55rem .9rem;font-weight:600}
+.stTabs [aria-selected="true"]{background:white;box-shadow:0 1px 5px #c9ddec}
+[data-testid="stImage"] img{object-fit:contain!important;max-height:105px;width:auto!important}
 </style>''', unsafe_allow_html=True)
+from zoneinfo import ZoneInfo
 logo = Path(__file__).with_name('logo_cc.png')
-if logo.exists():
-    st.image(str(logo), width=240)
-st.title('🏭 Producción Inteligente CC')
-st.caption('Planificación financiera de producción · Cuarto Creciente')
-st.info('Proyectá cobranzas, analizá rentabilidad y administrá fórmulas y stock de productos terminados.')
+head_logo, head_text = st.columns([1, 7], vertical_alignment='center')
+with head_logo:
+    if logo.exists():
+        st.image(str(logo), width=165)
+with head_text:
+    st.title('Producción Inteligente CC')
+    st.caption('Cuarto Creciente · Gestión de cobranzas, rentabilidad y producción')
+
+@st.fragment(run_every='60s')
+def show_local_clock():
+    now=datetime.now(ZoneInfo('America/Argentina/Buenos_Aires'))
+    st.caption(f'📅 {now:%d/%m/%Y}  ·  🕒 {now:%H:%M} hs (Argentina)')
+show_local_clock()
 
 
 def clean(x):
@@ -280,451 +294,580 @@ with st.sidebar:
     reference_date=st.date_input('Fecha inicial de planificación',value=datetime.now().date(),format='DD/MM/YYYY',help='Fecha desde la cual se analizan las cobranzas proyectadas.')
     st.caption('Los egresos se incorporarán más adelante. Las cobranzas proyectadas no equivalen a dinero efectivamente recibido.')
 
-st.subheader('Indicadores financieros')
-indicators=st.empty()
-with indicators.container():
-    a,b,c,d=st.columns(4)
-    for col,label in zip((a,b,c,d),('Ventas registradas','Cobranzas previstas','Cobranzas ajustadas','Techo preliminar')):
-        col.metric(label,'—')
+main_fin, main_profit, main_formulas, main_stock, main_demand = st.tabs([
+    '💰 Cobranzas y Cash Flow', '📊 Rentabilidad', '🧪 Fórmulas y rendimientos', '📦 Stock e historial', '🚚 Demanda y distribución'
+])
 
-if route_file:
+with main_fin:
+    st.subheader('Indicadores financieros')
+    indicators=st.empty()
+    with indicators.container():
+        a,b,c,d=st.columns(4)
+        for col,label in zip((a,b,c,d),('Ventas registradas','Cobranzas previstas','Cobranzas ajustadas','Techo preliminar')):
+            col.metric(label,'—')
+
+    if route_file:
+        try:
+            candidates=read_route(route_file)
+            names=[x[0] for x in candidates]
+            selected=st.selectbox('Día / pestaña a incorporar',names,index=names.index('9102026') if '9102026' in names else 0,help='Elegí la pestaña de la hoja de ruta que querés cargar. El sistema reconoce también la hoja 9102026.') if len(names)>1 else names[0]
+            raw=next(x[1] for x in candidates if x[0]==selected)
+            fallback=st.date_input('Fecha de entrega de esta hoja',value=datetime.now().date(),format='DD/MM/YYYY',help='Se usa si la fecha no puede identificarse a partir del nombre de la pestaña.')
+            preview=extract_route(selected,raw,fallback)
+            st.caption(f'Vista previa: {len(preview)} filas de la pestaña {selected}.')
+            st.dataframe(preview[['FECHA','CLIENTE','IMPORTE','CONDICIÓN DE PAGO','DÍAS DE PAGO','ESTADO CONDICIÓN']],hide_index=True,use_container_width=True)
+            if st.button('Guardar hoja de ruta en el historial',help='Agrega esta hoja al historial local de la plataforma y evita guardar dos veces una carga idéntica.'):
+                if save_route(preview):st.success('Hoja incorporada al historial.')
+                else:st.info('Esta misma hoja ya estaba guardada. No se duplicó.')
+        except Exception as e:
+            st.error(f'No se pudo interpretar la hoja de ruta: {e}')
+
+    st.warning('Almacenamiento provisional: el historial se guarda en la aplicación, pero Streamlit Cloud puede borrarlo al reiniciarse o volver a desplegarse. Descargá un respaldo después de cada carga. Para almacenamiento permanente y compartido conectaremos una base de datos externa.')
+
     try:
-        candidates=read_route(route_file)
-        names=[x[0] for x in candidates]
-        selected=st.selectbox('Día / pestaña a incorporar',names,index=names.index('9102026') if '9102026' in names else 0,help='Elegí la pestaña de la hoja de ruta que querés cargar. El sistema reconoce también la hoja 9102026.') if len(names)>1 else names[0]
-        raw=next(x[1] for x in candidates if x[0]==selected)
-        fallback=st.date_input('Fecha de entrega de esta hoja',value=datetime.now().date(),format='DD/MM/YYYY',help='Se usa si la fecha no puede identificarse a partir del nombre de la pestaña.')
-        preview=extract_route(selected,raw,fallback)
-        st.caption(f'Vista previa: {len(preview)} filas de la pestaña {selected}.')
-        st.dataframe(preview[['FECHA','CLIENTE','IMPORTE','CONDICIÓN DE PAGO','DÍAS DE PAGO','ESTADO CONDICIÓN']],hide_index=True,use_container_width=True)
-        if st.button('Guardar hoja de ruta en el historial',help='Agrega esta hoja al historial local de la plataforma y evita guardar dos veces una carga idéntica.'):
-            if save_route(preview):st.success('Hoja incorporada al historial.')
-            else:st.info('Esta misma hoja ya estaba guardada. No se duplicó.')
+        saved,batches=load_routes()
     except Exception as e:
-        st.error(f'No se pudo interpretar la hoja de ruta: {e}')
+        st.error(f'No se pudo consultar el historial: {e}');st.stop()
 
-st.warning('Almacenamiento provisional: el historial se guarda en la aplicación, pero Streamlit Cloud puede borrarlo al reiniciarse o volver a desplegarse. Descargá un respaldo después de cada carga. Para almacenamiento permanente y compartido conectaremos una base de datos externa.')
+    if not batches.empty:
+        with st.expander('Hojas de ruta incorporadas',expanded=False):
+            st.dataframe(batches.rename(columns={'fecha_carga':'CARGADA','hoja':'PESTAÑA','fecha_ruta':'FECHA RUTA','registros':'FILAS'}),hide_index=True,use_container_width=True)
 
-try:
-    saved,batches=load_routes()
-except Exception as e:
-    st.error(f'No se pudo consultar el historial: {e}');st.stop()
+    if not saved.empty:
+        buff=io.BytesIO()
+        with pd.ExcelWriter(buff,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as writer:
+            saved.to_excel(writer,sheet_name='Historial entregas',index=False)
+            batches.to_excel(writer,sheet_name='Hojas cargadas',index=False)
+        st.download_button('📥 Descargar respaldo del historial',buff.getvalue(),file_name='produccion_cc_respaldo_historial.xlsx',help='Guardá este archivo fuera de Streamlit para no perder los datos si se reinicia la aplicación.')
 
-if not batches.empty:
-    with st.expander('Hojas de ruta incorporadas',expanded=False):
-        st.dataframe(batches.rename(columns={'fecha_carga':'CARGADA','hoja':'PESTAÑA','fecha_ruta':'FECHA RUTA','registros':'FILAS'}),hide_index=True,use_container_width=True)
-
-if not saved.empty:
-    buff=io.BytesIO()
-    with pd.ExcelWriter(buff,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as writer:
-        saved.to_excel(writer,sheet_name='Historial entregas',index=False)
-        batches.to_excel(writer,sheet_name='Hojas cargadas',index=False)
-    st.download_button('📥 Descargar respaldo del historial',buff.getvalue(),file_name='produccion_cc_respaldo_historial.xlsx',help='Guardá este archivo fuera de Streamlit para no perder los datos si se reinicia la aplicación.')
-
-if st.button('🔎 Analizar cobranzas', type='primary', use_container_width=True,
-             help='Proyecta los ingresos por fecha del Cash Flow y de las hojas de ruta, evitando operaciones repetidas.'):
-    error = None
-    cashflow = pd.DataFrame()
-    if history_file is not None:
-        try:
-            cashflow = read_historical(history_file)
-        except Exception as exc:
-            error = str(exc)
-    if error:
-        st.error('No se pudo interpretar el Cash Flow: ' + error)
-    else:
-        forecast, excluded = build_forecast(saved, cashflow)
-        st.session_state['analysis'] = (forecast, excluded, float(initial_cash), int(risk),
-                                        int(horizon), float(safety), pd.Timestamp(reference_date))
-
-if 'analysis' in st.session_state:
-    forecast, excluded, cash, risk_used, horizon_used, reserve, start = st.session_state['analysis']
-    if forecast.empty:
-        st.warning('No encontramos cobranzas con fecha e importe. Cargá el Cash Flow o una hoja de ruta y presioná Analizar cobranzas.')
-    else:
-        forecast = forecast.copy()
-        forecast['FECHA COBRANZA'] = pd.to_datetime(forecast['FECHA COBRANZA'])
-        forecast['COBRANZA AJUSTADA'] = forecast['IMPORTE'] * (1-risk_used/100)
-        end = start + pd.Timedelta(days=horizon_used)
-        usable = forecast[forecast['FECHA COBRANZA'].between(start,end)].copy()
-        expected = float(usable['IMPORTE'].sum())
-        adjusted = float(usable['COBRANZA AJUSTADA'].sum())
-        budget = max(0, cash + adjusted - reserve)
-        with indicators.container():
-            a,b,c,d = st.columns(4)
-            a.metric('Caja inicial', money(cash))
-            b.metric(f'Cobranzas ({horizon_used} días)', money(expected))
-            c.metric('Ingresos prudentes', money(adjusted))
-            d.metric('Techo preliminar', money(budget))
-        st.caption('La caja proyectada es una simulación: las cobranzas futuras no están confirmadas. No incluye pagos a proveedores, sueldos ni impuestos.')
-        if excluded:
-            st.info(f'Se excluyeron {excluded} operaciones de hojas de ruta porque ya estaban en el Cash Flow (mismo cliente, fecha de entrega e importe).')
-        st.subheader('Calendario de ingresos para planificar producción')
-        daily = usable.groupby('FECHA COBRANZA',as_index=False).agg(
-            COBRANZA_PREVISTA=('IMPORTE','sum'), COBRANZA_AJUSTADA=('COBRANZA AJUSTADA','sum'))
-        days = pd.DataFrame({'FECHA COBRANZA':pd.date_range(start,end,freq='D')})
-        daily = days.merge(daily,on='FECHA COBRANZA',how='left').fillna(0)
-        daily['CAJA PROYECTADA'] = cash + daily['COBRANZA_AJUSTADA'].cumsum()
-        daily['TECHO PRELIMINAR'] = (daily['CAJA PROYECTADA']-reserve).clip(lower=0)
-        st.line_chart(daily.set_index('FECHA COBRANZA')[['CAJA PROYECTADA','TECHO PRELIMINAR']])
-        t1,t2,t3 = st.tabs(['Ingresos por día','Detalle de cobranzas','Por origen'])
-        with t1: st.dataframe(daily,hide_index=True,use_container_width=True)
-        with t2: st.dataframe(usable.sort_values('FECHA COBRANZA'),hide_index=True,use_container_width=True)
-        with t3:
-            st.dataframe(usable.groupby('ORIGEN',as_index=False).agg(COBRANZA=('IMPORTE','sum'),OPERACIONES=('IMPORTE','size')),hide_index=True,use_container_width=True)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as writer:
-            daily.to_excel(writer,sheet_name='Calendario ingresos',index=False)
-            forecast.to_excel(writer,sheet_name='Todas las cobranzas',index=False)
-            pd.DataFrame({'CONCEPTO':['Caja inicial','Ingresos previstos','Ingresos prudentes','Reserva','Techo preliminar'],
-                          'IMPORTE':[cash,expected,adjusted,reserve,budget]}).to_excel(writer,sheet_name='Resumen financiero',index=False)
-        st.download_button('📥 Descargar proyección de ingresos',output.getvalue(),
-                           file_name='produccion_cc_proyeccion_ingresos.xlsx',
-                           help='Descarga las fechas, importes y caja acumulada para planificar producción.')
-else:
-    st.info('Cargá el Cash Flow y/o guardá una hoja de ruta. Después presioná **Analizar cobranzas**.')
-
-
-st.divider()
-st.header('📊 Rentabilidad y planificación de producción')
-st.caption('Esta etapa cruza costos por bulto con el presupuesto preliminar de cobranzas. Todavía no considera pedidos pendientes, stock, egresos, capacidad productiva ni plazos de fabricación.')
-
-def read_profitability(upload):
-    df = pd.read_excel(upload, sheet_name=0)
-    colmap = {str(c).strip().lower(): c for c in df.columns}
-    required = ['artic.-conc.', 'costo2', 'margen', 'precio']
-    missing = [x for x in required if x not in colmap]
-    if missing:
-        raise ValueError('Faltan columnas: ' + ', '.join(missing) + '. Se esperan Artic.-Conc., COSTO2, MARGEN y precio.')
-    result = df[[colmap[x] for x in required]].copy()
-    result.columns = ['PRODUCTO', 'COSTO POR BULTO', 'MARGEN INFORMADO', 'PRECIO POR BULTO']
-    result['PRODUCTO'] = result['PRODUCTO'].astype(str).str.strip()
-    for col in ['COSTO POR BULTO', 'MARGEN INFORMADO', 'PRECIO POR BULTO']:
-        result[col] = pd.to_numeric(result[col], errors='coerce')
-    result = result[(result['PRODUCTO'] != '') & (result['PRODUCTO'].str.lower() != 'nan')].copy()
-    result['GANANCIA POR BULTO'] = result['PRECIO POR BULTO'] - result['COSTO POR BULTO']
-    result['MARGEN CALCULADO (%)'] = 100 * result['GANANCIA POR BULTO'] / result['PRECIO POR BULTO'].where(result['PRECIO POR BULTO'] > 0)
-    result['ESTADO'] = 'Válido'
-    result.loc[result['COSTO POR BULTO'].isna() | (result['COSTO POR BULTO'] <= 0), 'ESTADO'] = 'Revisar costo'
-    result.loc[result['PRECIO POR BULTO'].isna() | (result['PRECIO POR BULTO'] <= 0), 'ESTADO'] = 'Revisar precio'
-    result.loc[(result['ESTADO'] == 'Válido') & (result['GANANCIA POR BULTO'] <= 0), 'ESTADO'] = 'Sin margen positivo'
-    return result
-
-if profitability_file is None:
-    st.info('Subí el Excel de costos, márgenes y precios para comparar productos y simular la fabricación.')
-else:
-    try:
-        profitability = read_profitability(profitability_file)
-        valid = profitability[profitability['ESTADO'] == 'Válido'].copy()
-        p1,p2,p3 = st.columns(3)
-        p1.metric('Productos registrados', str(len(profitability)))
-        p2.metric('Productos con costo válido', str(len(valid)))
-        p3.metric('Productos para revisar', str(len(profitability)-len(valid)))
-        if len(valid) < len(profitability):
-            st.warning('Los productos sin costo positivo, precio válido o margen positivo no se utilizan en la simulación. No se supone que su fabricación sea gratuita.')
-        st.dataframe(profitability, use_container_width=True, hide_index=True,
-                     column_config={'MARGEN INFORMADO': st.column_config.NumberColumn('Margen informado',format='%.2f'),
-                                    'MARGEN CALCULADO (%)': st.column_config.NumberColumn('Margen calculado (%)',format='%.2f')})
-        st.subheader('Simulación por producto')
-        st.caption('Elegí un producto y una cantidad. Se calcula el capital necesario y la ganancia potencial si se venden todos los bultos. No es una orden de fabricación.')
-        if not valid.empty:
-            chosen = st.selectbox('Producto a simular', valid['PRODUCTO'].tolist(), key='sim_product', help='Solo aparecen productos con costo y precio válidos y ganancia positiva.')
-            qty = st.number_input('Bultos a fabricar (simulación)', min_value=0, max_value=1000000, value=100, step=10,
-                                  help='Cantidad hipotética. Cuando carguemos pedidos y stock, usaremos la necesidad real.')
-            item = valid[valid['PRODUCTO'] == chosen].iloc[0]
-            investment = float(qty) * float(item['COSTO POR BULTO'])
-            potential_sales = float(qty) * float(item['PRECIO POR BULTO'])
-            potential_profit = potential_sales - investment
-            s1,s2,s3 = st.columns(3)
-            s1.metric('Inversión requerida', money(investment))
-            s2.metric('Venta potencial', money(potential_sales))
-            s3.metric('Ganancia bruta potencial', money(potential_profit))
-            if 'analysis' in st.session_state:
-                fc,exc,cc,rr,hh,res,start = st.session_state['analysis']
-                fc = fc.copy()
-                fc['FECHA COBRANZA'] = pd.to_datetime(fc['FECHA COBRANZA'])
-                horizon_end = start + pd.Timedelta(days=hh)
-                within = fc[fc['FECHA COBRANZA'].between(start,horizon_end)]
-                available = max(0.0, cc + float(within['IMPORTE'].sum()) * (1-rr/100) - res)
-                st.metric('Presupuesto preliminar según cobranzas', money(available))
-                if investment > available:
-                    st.warning('Esta simulación supera el presupuesto preliminar de fabricación calculado con las cobranzas.')
-                else:
-                    st.success('Esta simulación entra en el presupuesto preliminar, antes de descontar egresos y otras obligaciones.')
-                if float(item['COSTO POR BULTO']) > 0:
-                    st.caption(f'Con ese presupuesto, el máximo teórico de este producto sería {int(available // float(item["COSTO POR BULTO"])):,} bultos, sin fabricar otros productos ni considerar demanda.'.replace(',', '.'))
-            else:
-                st.info('Presioná «Analizar cobranzas» arriba para comparar esta inversión con el dinero proyectado.')
-        output_profit = io.BytesIO()
-        with pd.ExcelWriter(output_profit, engine='xlsxwriter') as writer:
-            profitability.to_excel(writer, sheet_name='Rentabilidad por bulto', index=False)
-        st.download_button('📥 Descargar análisis de rentabilidad', output_profit.getvalue(),
-                           file_name='produccion_cc_rentabilidad.xlsx',
-                           help='Exporta costos, precios, márgenes calculados y advertencias de validación.')
-    except Exception as exc:
-        st.error('No se pudo interpretar el Excel de rentabilidad: ' + str(exc))
-
-
-st.divider()
-st.header('🧪 Fórmulas y rendimientos')
-st.caption('El plan utiliza el rendimiento Bejerman (incluye merma). Solo se admiten elaboraciones completas. Cada edición genera una versión nueva y conserva las anteriores.')
-
-def formulas_db():
-    with sqlite3.connect(store_path()) as con:
-        con.execute('CREATE TABLE IF NOT EXISTS formulas (codigo TEXT, version INTEGER, producto TEXT, rendimiento_bejerman REAL, rendimiento_teorico REAL, observaciones TEXT, creado TEXT, origen TEXT, PRIMARY KEY(codigo,version))')
-        con.execute('CREATE TABLE IF NOT EXISTS formula_ingredientes (codigo TEXT, version INTEGER, posicion INTEGER, grupo TEXT, ingrediente TEXT, cantidad REAL, unidad TEXT, brix REAL, PRIMARY KEY(codigo,version,posicion))')
-
-def formula_versions():
-    with sqlite3.connect(store_path()) as con:
-        return pd.read_sql_query('SELECT * FROM formulas ORDER BY producto,version DESC',con)
-
-def formula_ingredients(code,version):
-    with sqlite3.connect(store_path()) as con:
-        return pd.read_sql_query('SELECT grupo,ingrediente,cantidad,unidad,brix FROM formula_ingredientes WHERE codigo=? AND version=? ORDER BY posicion',con,params=(code,int(version)))
-
-def save_formula(code,product,bejerman,theoretical,notes,ingredients,origin):
-    code=str(code).strip().upper();product=str(product).strip()
-    if not code or not product: raise ValueError('Completá el código y el nombre del producto.')
-    if not np.isfinite(bejerman) or bejerman<=0: raise ValueError('El rendimiento Bejerman debe ser mayor que cero.')
-    if ingredients.empty: raise ValueError('La fórmula debe tener ingredientes.')
-    data=[]
-    for _,r in ingredients.iterrows():
-        name=str(r.get('ingrediente','')).strip()
-        if not name or name.lower()=='nan': continue
-        qty=pd.to_numeric(r.get('cantidad'),errors='coerce')
-        if pd.isna(qty) or qty<0: raise ValueError('Revisá las cantidades: deben ser números no negativos.')
-        brix=pd.to_numeric(r.get('brix'),errors='coerce')
-        data.append((str(r.get('grupo','') or ''),name,float(qty),str(r.get('unidad','') or ''),None if pd.isna(brix) else float(brix)))
-    if not data: raise ValueError('No hay ingredientes válidos.')
-    with sqlite3.connect(store_path()) as con:
-        last=con.execute('SELECT MAX(version) FROM formulas WHERE codigo=?',(code,)).fetchone()[0]
-        version=1 if last is None else last+1
-        con.execute('INSERT INTO formulas VALUES (?,?,?,?,?,?,?,?)',(code,version,product,float(bejerman),None if pd.isna(theoretical) else float(theoretical),notes,datetime.now().isoformat(timespec='seconds'),origin))
-        con.executemany('INSERT INTO formula_ingredientes VALUES (?,?,?,?,?,?,?,?)',[(code,version,i,*r) for i,r in enumerate(data)])
-    return version
-
-def parse_formula_excel(upload):
-    book=pd.ExcelFile(upload)
-    raw=pd.read_excel(book,sheet_name=0,header=None)
-    def cell(r,c):
-        return raw.iat[r,c] if r<len(raw) and c<len(raw.columns) else None
-    code=None;name=None;revision=None;bej=None;theo=None;items=[];in_table=False;group=''
-    for i in range(len(raw)):
-        vals=[clean(v) if pd.notna(v) else '' for v in raw.iloc[i].tolist()]
-        if 'VERSION' in vals and 'CODIGO' in vals:
-            revision=cell(i+1,vals.index('VERSION'));code=cell(i+1,vals.index('CODIGO'))
-        if any('MERMELADA' in v or 'JUGO' in v or 'DULCE' in v for v in vals[:2]) and name is None:
-            name=cell(i,0)
-        label=vals[0] if vals else ''
-        if 'RENDIMIENTO BEJERMAN' in label:bej=pd.to_numeric(cell(i,2),errors='coerce')
-        if label=='RENDIMIENTO TEORICO':theo=pd.to_numeric(cell(i,2),errors='coerce')
-        if len(vals)>3 and vals[1]=='INGREDIENTE' and vals[2]=='CANTIDAD':in_table=True;continue
-        if in_table:
-            if 'MASA TOTAL' in label or 'DATOS FISICOQUIMICOS' in label:in_table=False;continue
-            ingredient=cell(i,1);qty=pd.to_numeric(cell(i,2),errors='coerce')
-            if pd.notna(cell(i,0)) and str(cell(i,0)).strip():group=str(cell(i,0)).strip()
-            if pd.notna(ingredient) and str(ingredient).strip() and pd.notna(qty):
-                brix=pd.to_numeric(cell(i,4),errors='coerce')
-                items.append({'grupo':group,'ingrediente':str(ingredient).strip(),'cantidad':float(qty),'unidad':str(cell(i,3) or ''),'brix':None if pd.isna(brix) else float(brix)})
-    if not code or pd.isna(bej) or not items:
-        raise ValueError('No pude encontrar código, rendimiento Bejerman e ingredientes. Revisá que el archivo tenga el formato del modelo.')
-    return {'codigo':str(code).strip(),'producto':str(name or code).strip(),'revision_original':revision,'bejerman':float(bej),'teorico':float(theo) if pd.notna(theo) else 0.,'ingredientes':pd.DataFrame(items)}
-
-formulas_db()
-f1,f2,f3=st.tabs(['📥 Importar fórmula','📚 Fórmulas e historial','✏️ Editar y simular'])
-with f1:
-    formula_file=st.file_uploader('Subir fórmula de elaboración (.xlsx)',type=['xlsx','xls'],key='formula_upload',help='Subí un Excel de fórmula como el modelo de Mermelada Stevia Arándano. Se leerán ingredientes, código y rendimiento Bejerman.')
-    if formula_file:
-        try:
-            parsed=parse_formula_excel(formula_file)
-            st.write(f"**{parsed['producto']}** · Código {parsed['codigo']} · Revisión del Excel: {parsed['revision_original']}")
-            x,y=st.columns(2)
-            x.metric('Rendimiento Bejerman (packs)',f"{parsed['bejerman']:,.2f}")
-            y.metric('Rendimiento teórico (packs)',f"{parsed['teorico']:,.2f}")
-            st.dataframe(parsed['ingredientes'],hide_index=True,use_container_width=True)
-            import_note=st.text_input('Observaciones de importación',key='formula_import_note',help='Anotá el motivo de la carga o la revisión de la fórmula.')
-            if st.button('Guardar fórmula como nueva versión',type='primary',key='formula_import_save'):
-                version=save_formula(parsed['codigo'],parsed['producto'],parsed['bejerman'],parsed['teorico'],import_note,parsed['ingredientes'],f'Excel: {formula_file.name}; revisión origen {parsed["revision_original"]}')
-                st.success(f'Fórmula guardada. Versión interna {version}. Se conservaron las versiones anteriores.')
-        except Exception as exc:st.error('No se pudo importar la fórmula: '+str(exc))
-with f2:
-    versions=formula_versions()
-    if versions.empty:st.info('Todavía no hay fórmulas guardadas. Importá la primera desde Excel.')
-    else:
-        latest=versions.sort_values('version').drop_duplicates('codigo',keep='last')
-        st.subheader('Fórmulas vigentes')
-        st.dataframe(latest[['codigo','producto','version','rendimiento_bejerman','rendimiento_teorico','creado']],hide_index=True,use_container_width=True)
-        st.subheader('Historial de revisiones')
-        st.dataframe(versions[['codigo','producto','version','rendimiento_bejerman','observaciones','creado','origen']],hide_index=True,use_container_width=True)
-        export=io.BytesIO()
-        with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
-            versions.to_excel(writer,sheet_name='Versiones',index=False)
-            with sqlite3.connect(store_path()) as con:
-                pd.read_sql_query('SELECT * FROM formula_ingredientes',con).to_excel(writer,sheet_name='Ingredientes',index=False)
-        st.download_button('📥 Descargar respaldo de fórmulas',export.getvalue(),file_name='respaldo_formulas_cc.xlsx',help='Guardá una copia externa: el almacenamiento local de Streamlit Cloud puede perderse al reiniciar.')
-with f3:
-    versions=formula_versions()
-    if versions.empty:st.info('Importá una fórmula para habilitar su edición y simulación.')
-    else:
-        options=versions.sort_values('version').drop_duplicates('codigo',keep='last')
-        selected_code=st.selectbox('Producto / código',options['codigo'].tolist(),format_func=lambda c:f"{options.loc[options.codigo==c,'producto'].iloc[0]} ({c})",key='formula_code')
-        relevant=versions[versions.codigo==selected_code]
-        chosen_version=st.selectbox('Versión para consultar o editar',relevant.version.tolist(),key='formula_version')
-        base=relevant[relevant.version==chosen_version].iloc[0]
-        ingredients=formula_ingredients(selected_code,chosen_version)
-        with st.form('formula_edit_form'):
-            new_product=st.text_input('Nombre del producto',value=base['producto'])
-            new_bej=st.number_input('Rendimiento Bejerman (packs por elaboración)',min_value=0.01,value=float(base['rendimiento_bejerman']),format='%.4f',help='Rendimiento con merma. Es el utilizado para calcular elaboraciones completas.')
-            new_theo=st.number_input('Rendimiento teórico (referencia)',min_value=0.0,value=float(base['rendimiento_teorico'] or 0),format='%.4f')
-            edited=st.data_editor(ingredients,num_rows='dynamic',hide_index=True,use_container_width=True,key=f'edit_{selected_code}_{chosen_version}',column_config={'cantidad':st.column_config.NumberColumn('Cantidad',min_value=0),'ingrediente':st.column_config.TextColumn('Ingrediente',required=True)})
-            edit_note=st.text_input('Motivo del cambio / observaciones',help='El historial conserva esta nota junto con la fecha de la nueva versión.')
-            submitted=st.form_submit_button('Guardar cambios como nueva versión',type='primary')
-        if submitted:
+    if st.button('🔎 Analizar cobranzas', type='primary', use_container_width=True,
+                 help='Proyecta los ingresos por fecha del Cash Flow y de las hojas de ruta, evitando operaciones repetidas.'):
+        error = None
+        cashflow = pd.DataFrame()
+        if history_file is not None:
             try:
-                if not edit_note.strip():raise ValueError('Indicá el motivo de la modificación para conservar la trazabilidad.')
-                new_ver=save_formula(selected_code,new_product,new_bej,new_theo,edit_note,edited,f'Edición de versión {chosen_version}')
-                st.success(f'Nueva versión {new_ver} guardada. La versión {chosen_version} permanece en el historial.')
-            except Exception as exc:st.error(str(exc))
-        st.subheader('Simular necesidad de elaboraciones completas')
-        demand=st.number_input('Bultos necesarios (después de descontar stock)',min_value=0,max_value=1000000,value=150,step=1,key='formula_demand')
-        # Se descartan fracciones: no se pueden despachar packs incompletos.
-        usable=int(np.floor(float(base['rendimiento_bejerman'])))
-        if usable<1:st.warning('El rendimiento Bejerman es menor a un bulto completo. Revisá la unidad de medida.')
+                cashflow = read_historical(history_file)
+            except Exception as exc:
+                error = str(exc)
+        if error:
+            st.error('No se pudo interpretar el Cash Flow: ' + error)
         else:
-            batches=int(np.ceil(demand/usable))
-            produced=batches*usable
-            a,b,c=st.columns(3)
-            a.metric('Elaboraciones completas',str(batches))
-            b.metric('Bultos utilizables',str(produced))
-            c.metric('Excedente estimado',str(produced-demand))
-            st.caption(f'Se toman {usable} bultos completos por elaboración (rendimiento Bejerman {float(base["rendimiento_bejerman"]):.2f}). No se permiten elaboraciones parciales. Esta simulación no descuenta materias primas ni presupuesto.')
+            forecast, excluded = build_forecast(saved, cashflow)
+            st.session_state['analysis'] = (forecast, excluded, float(initial_cash), int(risk),
+                                            int(horizon), float(safety), pd.Timestamp(reference_date))
 
-st.warning('Importante: el historial de fórmulas usa una base SQLite local. En Streamlit Cloud puede perderse al reiniciar o redesplegar. Descargá respaldos y conectemos una base de datos persistente antes de usarlo como registro definitivo.')
+    if 'analysis' in st.session_state:
+        forecast, excluded, cash, risk_used, horizon_used, reserve, start = st.session_state['analysis']
+        if forecast.empty:
+            st.warning('No encontramos cobranzas con fecha e importe. Cargá el Cash Flow o una hoja de ruta y presioná Analizar cobranzas.')
+        else:
+            forecast = forecast.copy()
+            forecast['FECHA COBRANZA'] = pd.to_datetime(forecast['FECHA COBRANZA'])
+            forecast['COBRANZA AJUSTADA'] = forecast['IMPORTE'] * (1-risk_used/100)
+            end = start + pd.Timedelta(days=horizon_used)
+            usable = forecast[forecast['FECHA COBRANZA'].between(start,end)].copy()
+            expected = float(usable['IMPORTE'].sum())
+            adjusted = float(usable['COBRANZA AJUSTADA'].sum())
+            budget = max(0, cash + adjusted - reserve)
+            with indicators.container():
+                a,b,c,d = st.columns(4)
+                a.metric('Caja inicial', money(cash))
+                b.metric(f'Cobranzas ({horizon_used} días)', money(expected))
+                c.metric('Ingresos prudentes', money(adjusted))
+                d.metric('Techo preliminar', money(budget))
+            st.caption('La caja proyectada es una simulación: las cobranzas futuras no están confirmadas. No incluye pagos a proveedores, sueldos ni impuestos.')
+            if excluded:
+                st.info(f'Se excluyeron {excluded} operaciones de hojas de ruta porque ya estaban en el Cash Flow (mismo cliente, fecha de entrega e importe).')
+            st.subheader('Calendario de ingresos para planificar producción')
+            daily = usable.groupby('FECHA COBRANZA',as_index=False).agg(
+                COBRANZA_PREVISTA=('IMPORTE','sum'), COBRANZA_AJUSTADA=('COBRANZA AJUSTADA','sum'))
+            days = pd.DataFrame({'FECHA COBRANZA':pd.date_range(start,end,freq='D')})
+            daily = days.merge(daily,on='FECHA COBRANZA',how='left').fillna(0)
+            daily['CAJA PROYECTADA'] = cash + daily['COBRANZA_AJUSTADA'].cumsum()
+            daily['TECHO PRELIMINAR'] = (daily['CAJA PROYECTADA']-reserve).clip(lower=0)
+            st.markdown('#### 📅 Calendario mensual de cobranzas')
+            st.caption('Importes previstos por fecha de cobro. El color identifica los días con ingresos proyectados; no significa que estén efectivamente cobrados.')
+            calendar_months = pd.period_range(forecast['FECHA COBRANZA'].min().to_period('M'), forecast['FECHA COBRANZA'].max().to_period('M'), freq='M')
+            if len(calendar_months) > 240:
+                calendar_months = pd.period_range(start.to_period('M')-12, start.to_period('M')+12, freq='M')
+            month_keys = [str(m) for m in calendar_months]
+            default_month = str(start.to_period('M'))
+            month_idx = month_keys.index(default_month) if default_month in month_keys else 0
+            selected_month = st.selectbox('Mes a visualizar', month_keys, index=month_idx, key='collection_month', help='Elegí el mes de las cobranzas previstas. Podés consultar meses fuera del horizonte de planificación.')
+            year, month = map(int, selected_month.split('-'))
+            monthly = forecast.loc[(forecast['FECHA COBRANZA'].dt.year == year) & (forecast['FECHA COBRANZA'].dt.month == month)].copy()
+            monthly['AJUSTADA'] = monthly['IMPORTE'] * (1-risk_used/100)
+            monthly_by_day = monthly.groupby(monthly['FECHA COBRANZA'].dt.day).agg(prevista=('IMPORTE','sum'),ajustada=('AJUSTADA','sum'),operaciones=('IMPORTE','size')).to_dict('index')
+            m1,m2,m3 = st.columns(3)
+            m1.metric('Cobranza del mes', money(monthly['IMPORTE'].sum()))
+            m2.metric('Cobranza prudente del mes', money(monthly['AJUSTADA'].sum()))
+            m3.metric('Operaciones previstas', str(len(monthly)))
+            weekdays = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom']
+            cells = ['<div class="cc-weekday">'+x+'</div>' for x in weekdays]
+            for week in calendar.monthcalendar(year,month):
+                for day in week:
+                    if day == 0:
+                        cells.append('<div class="cc-day cc-empty"></div>')
+                        continue
+                    values = monthly_by_day.get(day)
+                    css = ' cc-income' if values else ''
+                    label = '<span class="cc-amount">'+html.escape(money(values['prevista']))+'</span><span class="cc-count">'+str(values['operaciones'])+' operación(es)</span>' if values else '<span class="cc-count">Sin cobranzas</span>'
+                    cells.append('<div class="cc-day'+css+'"><span class="cc-number">'+str(day)+'</span>'+label+'</div>')
+            st.markdown('''<style>
+            .cc-month-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}
+            .cc-weekday{text-align:center;font-weight:700;color:#285a77;padding:8px 0;background:#eaf4fa;border-radius:7px}
+            .cc-day{border:1px solid #dce5eb;border-radius:9px;min-height:93px;padding:7px;display:flex;flex-direction:column;gap:6px;overflow-wrap:anywhere}
+            .cc-income{background:#e7f4fd;border-color:#9bcde9}
+            .cc-empty{border:none;background:transparent}
+            .cc-number{font-size:.9rem;font-weight:700;color:#184a67}
+            .cc-amount{font-weight:750;font-size:clamp(.65rem,.9vw,.92rem);color:#145b88}
+            .cc-count{font-size:.69rem;color:#637d8b}
+            @media(max-width:700px){.cc-day{min-height:78px;padding:4px}.cc-amount{font-size:.66rem}.cc-count{display:none}}
+            </style>''' + '<div class="cc-month-grid">'+''.join(cells)+'</div>',unsafe_allow_html=True)
+            with st.expander('Detalle de las cobranzas del mes'):
+                st.dataframe(monthly.sort_values('FECHA COBRANZA'),hide_index=True,use_container_width=True)
+            st.line_chart(daily.set_index('FECHA COBRANZA')[['CAJA PROYECTADA','TECHO PRELIMINAR']])
+            t1,t2,t3 = st.tabs(['Ingresos por día','Detalle de cobranzas','Por origen'])
+            with t1: st.dataframe(daily,hide_index=True,use_container_width=True)
+            with t2: st.dataframe(usable.sort_values('FECHA COBRANZA'),hide_index=True,use_container_width=True)
+            with t3:
+                st.dataframe(usable.groupby('ORIGEN',as_index=False).agg(COBRANZA=('IMPORTE','sum'),OPERACIONES=('IMPORTE','size')),hide_index=True,use_container_width=True)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output,engine='xlsxwriter',datetime_format='dd/mm/yyyy') as writer:
+                daily.to_excel(writer,sheet_name='Calendario ingresos',index=False)
+                forecast.to_excel(writer,sheet_name='Todas las cobranzas',index=False)
+                pd.DataFrame({'CONCEPTO':['Caja inicial','Ingresos previstos','Ingresos prudentes','Reserva','Techo preliminar'],
+                              'IMPORTE':[cash,expected,adjusted,reserve,budget]}).to_excel(writer,sheet_name='Resumen financiero',index=False)
+            st.download_button('📥 Descargar proyección de ingresos',output.getvalue(),
+                               file_name='produccion_cc_proyeccion_ingresos.xlsx',
+                               help='Descarga las fechas, importes y caja acumulada para planificar producción.')
+    else:
+        st.info('Cargá el Cash Flow y/o guardá una hoja de ruta. Después presioná **Analizar cobranzas**.')
 
 
-# ─── STOCK DE PRODUCTOS TERMINADOS: FOTOGRAFÍAS POR FECHA ───
-st.divider()
-st.header('📦 Stock e historial')
-st.caption('Stock expresado en bultos. Cada carga guarda una fotografía completa de las existencias; no se suman stocks de diferentes fechas.')
 
-def init_stock_db():
-    with sqlite3.connect(store_path()) as con:
-        con.execute('CREATE TABLE IF NOT EXISTS stock_cargas (id INTEGER PRIMARY KEY AUTOINCREMENT, fecha_stock TEXT NOT NULL, fecha_carga TEXT NOT NULL, archivo TEXT NOT NULL, firma TEXT UNIQUE NOT NULL, origen TEXT NOT NULL, observaciones TEXT)')
-        con.execute('CREATE TABLE IF NOT EXISTS stock_detalle (carga_id INTEGER NOT NULL, codigo TEXT NOT NULL, descripcion TEXT NOT NULL, bultos REAL NOT NULL, PRIMARY KEY(carga_id,codigo), FOREIGN KEY(carga_id) REFERENCES stock_cargas(id))')
+with main_profit:
+    st.header('📊 Rentabilidad y planificación de producción')
+    st.caption('Esta etapa cruza costos por bulto con el presupuesto preliminar de cobranzas. Todavía no considera pedidos pendientes, stock, egresos, capacidad productiva ni plazos de fabricación.')
 
-def parse_stock_excel(upload):
-    book=pd.ExcelFile(upload)
-    for sheet in book.sheet_names:
-        raw=pd.read_excel(book,sheet_name=sheet,header=None,dtype=object)
-        for i in range(min(len(raw),35)):
-            labels=[clean(v) for v in raw.iloc[i].tolist()]
-            code_col=next((j for j,v in enumerate(labels) if v in ('COD','CODIGO','COD.','ARTICULO')),None)
-            name_col=next((j for j,v in enumerate(labels) if v in ('DESCRIPCION','DESCRIPCIÓN','PRODUCTO','DETALLE')),None)
-            qty_col=next((j for j,v in enumerate(labels) if v in ('STOCK','EXISTENCIA','EXISTENCIAS','CANTIDAD')),None)
-            if None in (code_col,name_col,qty_col):continue
-            data=raw.iloc[i+1:,[code_col,name_col,qty_col]].copy()
-            data.columns=['codigo','descripcion','bultos']
-            data['codigo']=data['codigo'].apply(lambda v: str(v).strip().upper() if pd.notna(v) else '')
-            data['descripcion']=data['descripcion'].fillna('').astype(str).str.strip()
-            data['bultos']=data['bultos'].apply(parse_amount)
-            data=data[(data.codigo!='') & (data.descripcion!='') & data.bultos.notna()].copy()
-            data=data[~data.codigo.str.contains(r'^(TOTAL|SUBTOTAL|COD)$',case=False,regex=True)]
-            if data.empty:continue
-            if data.codigo.duplicated().any():
-                repeated=', '.join(data.loc[data.codigo.duplicated(),'codigo'].head(5))
-                raise ValueError(f'El archivo tiene códigos repetidos ({repeated}). Revisá el reporte antes de guardarlo.')
-            if (data.bultos<0).any():
-                st.warning('El archivo contiene stock negativo. Se conservará tal como figura en Bejerman y se marcará para revisión.')
-            return data.sort_values('codigo').reset_index(drop=True),sheet
-    raise ValueError('No encontré las columnas COD, DESCRIPCION y STOCK. Revisá que el archivo sea el reporte de stock de Bejerman.')
+    def read_profitability(upload):
+        df = pd.read_excel(upload, sheet_name=0)
+        colmap = {str(c).strip().lower(): c for c in df.columns}
+        required = ['artic.-conc.', 'costo2', 'margen', 'precio']
+        missing = [x for x in required if x not in colmap]
+        if missing:
+            raise ValueError('Faltan columnas: ' + ', '.join(missing) + '. Se esperan Artic.-Conc., COSTO2, MARGEN y precio.')
+        result = df[[colmap[x] for x in required]].copy()
+        result.columns = ['PRODUCTO', 'COSTO POR BULTO', 'MARGEN INFORMADO', 'PRECIO POR BULTO']
+        result['PRODUCTO'] = result['PRODUCTO'].astype(str).str.strip()
+        for col in ['COSTO POR BULTO', 'MARGEN INFORMADO', 'PRECIO POR BULTO']:
+            result[col] = pd.to_numeric(result[col], errors='coerce')
+        result = result[(result['PRODUCTO'] != '') & (result['PRODUCTO'].str.lower() != 'nan')].copy()
+        result['GANANCIA POR BULTO'] = result['PRECIO POR BULTO'] - result['COSTO POR BULTO']
+        result['MARGEN CALCULADO (%)'] = 100 * result['GANANCIA POR BULTO'] / result['PRECIO POR BULTO'].where(result['PRECIO POR BULTO'] > 0)
+        result['ESTADO'] = 'Válido'
+        result.loc[result['COSTO POR BULTO'].isna() | (result['COSTO POR BULTO'] <= 0), 'ESTADO'] = 'Revisar costo'
+        result.loc[result['PRECIO POR BULTO'].isna() | (result['PRECIO POR BULTO'] <= 0), 'ESTADO'] = 'Revisar precio'
+        result.loc[(result['ESTADO'] == 'Válido') & (result['GANANCIA POR BULTO'] <= 0), 'ESTADO'] = 'Sin margen positivo'
+        return result
 
-def stock_snapshots():
-    with sqlite3.connect(store_path()) as con:
-        return pd.read_sql_query('SELECT * FROM stock_cargas ORDER BY fecha_stock DESC, id DESC',con)
-
-def stock_details(snapshot_id):
-    with sqlite3.connect(store_path()) as con:
-        return pd.read_sql_query('SELECT codigo,descripcion,bultos FROM stock_detalle WHERE carga_id=? ORDER BY codigo',con,params=(int(snapshot_id),))
-
-def save_stock(data,date_value,filename,origin='Excel',notes=''):
-    normalized=data.sort_values('codigo').copy()
-    payload=f"{date_value.isoformat()}\n"+normalized[['codigo','descripcion','bultos']].to_csv(index=False,float_format='%.6f')
-    fingerprint=hashlib.sha256(payload.encode('utf-8')).hexdigest()
-    with sqlite3.connect(store_path()) as con:
-        if con.execute('SELECT 1 FROM stock_cargas WHERE firma=?',(fingerprint,)).fetchone():return None
-        cur=con.execute('INSERT INTO stock_cargas (fecha_stock,fecha_carga,archivo,firma,origen,observaciones) VALUES (?,?,?,?,?,?)',(date_value.isoformat(),datetime.now().isoformat(timespec='seconds'),filename,fingerprint,origin,notes))
-        con.executemany('INSERT INTO stock_detalle (carga_id,codigo,descripcion,bultos) VALUES (?,?,?,?)',[(cur.lastrowid,str(r.codigo),str(r.descripcion),float(r.bultos)) for r in normalized.itertuples(index=False)])
-        return cur.lastrowid
-
-init_stock_db()
-s1,s2,s3,s4=st.tabs(['📥 Cargar stock','📦 Stock actual','📊 Comparar fechas','📚 Historial y respaldo'])
-with s1:
-    st.info('Subí el reporte de productos terminados de Bejerman en formato .xlsx. La fecha representa cuándo se midió el stock, no cuándo se subió el archivo.')
-    stock_file=st.file_uploader('Excel de stock (.xlsx)',type=['xlsx'],key='stock_upload',help='Reporte de Bejerman con COD, DESCRIPCION y STOCK. Las cantidades están expresadas en bultos.')
-    stock_date=st.date_input('Fecha correspondiente al stock',value=datetime(2026,10,9).date(),key='stock_date',help='Elegí la fecha del reporte. Cada fecha puede tener distintas versiones si se corrige el stock.')
-    stock_notes=st.text_input('Observaciones (opcional)',key='stock_notes',help='Por ejemplo: cierre del día, recuento físico o ajuste del reporte.')
-    if stock_file is not None:
+    if profitability_file is None:
+        st.info('Subí el Excel de costos, márgenes y precios para comparar productos y simular la fabricación.')
+    else:
         try:
-            preview,sheet=parse_stock_excel(stock_file)
-            c1,c2,c3=st.columns(3)
-            c1.metric('Productos',len(preview))
-            c2.metric('Con stock positivo',int((preview.bultos>0).sum()))
-            c3.metric('Bultos netos',f'{preview.bultos.sum():,.0f}'.replace(',','.'))
-            st.dataframe(preview.rename(columns={'codigo':'Código','descripcion':'Producto','bultos':'Stock (bultos)'}),hide_index=True,use_container_width=True)
-            if st.button('Guardar fotografía de stock',type='primary',key='stock_save',help='Guarda una nueva fotografía completa. Si ya existe exactamente la misma carga para esa fecha, no se duplica.'):
-                result=save_stock(preview,stock_date,stock_file.name,notes=stock_notes)
-                if result is None:st.info('Esta fotografía de stock ya estaba guardada para esa fecha. No se duplicó.')
-                else:st.success(f'Stock del {stock_date.strftime("%d/%m/%Y")} guardado como registro #{result}.')
-        except Exception as exc:st.error(f'No pude interpretar el Excel de stock: {exc}')
-with s2:
-    snaps=stock_snapshots()
-    if snaps.empty:st.info('Todavía no hay stock guardado. Cargá el primer Excel en la pestaña anterior.')
-    else:
-        latest=snaps.iloc[0]
-        current=stock_details(latest.id)
-        st.caption(f'Última fotografía: {pd.to_datetime(latest.fecha_stock).strftime("%d/%m/%Y")} · registro #{int(latest.id)} · {latest.archivo}')
-        a,b,c=st.columns(3)
-        a.metric('Productos',len(current))
-        b.metric('Con stock',int((current.bultos>0).sum()))
-        c.metric('Bultos netos',f'{current.bultos.sum():,.0f}'.replace(',','.'))
-        query=st.text_input('Buscar por código o producto',key='stock_search')
-        if query:
-            current=current[current.codigo.str.contains(query,case=False,regex=False)|current.descripcion.str.contains(query,case=False,regex=False)]
-        st.dataframe(current.rename(columns={'codigo':'Código','descripcion':'Producto','bultos':'Stock (bultos)'}),hide_index=True,use_container_width=True)
-        st.caption('El stock más reciente se selecciona por fecha del reporte, no por fecha de carga. Si existen varias versiones del mismo día, se utiliza la última guardada.')
-with s3:
-    snaps=stock_snapshots()
-    if len(snaps)<2:st.info('Cuando guardes al menos dos fotografías, podrás comparar los cambios de stock por producto.')
-    else:
-        labels={int(r.id):f'{pd.to_datetime(r.fecha_stock).strftime("%d/%m/%Y")} · registro #{int(r.id)}' for r in snaps.itertuples(index=False)}
-        options=list(labels)
-        a,b=st.columns(2)
-        older=a.selectbox('Fotografía anterior',options,index=1,format_func=lambda k:labels[k],key='stock_compare_old')
-        newer=b.selectbox('Fotografía posterior',options,index=0,format_func=lambda k:labels[k],key='stock_compare_new')
-        if older==newer:st.warning('Elegí dos fotografías diferentes.')
-        else:
-            old=stock_details(older).rename(columns={'bultos':'Stock anterior','descripcion':'Descripción anterior'})
-            new=stock_details(newer).rename(columns={'bultos':'Stock nuevo'})
-            comparison=old.merge(new,on='codigo',how='outer')
-            comparison['descripcion']=comparison['descripcion'].fillna(comparison['Descripción anterior'])
-            comparison['Stock anterior']=comparison['Stock anterior'].fillna(0)
-            comparison['Stock nuevo']=comparison['Stock nuevo'].fillna(0)
-            comparison['Diferencia']=comparison['Stock nuevo']-comparison['Stock anterior']
-            comparison=comparison[['codigo','descripcion','Stock anterior','Stock nuevo','Diferencia']].sort_values('Diferencia')
-            st.metric('Variación neta de bultos',f'{comparison.Diferencia.sum():+,.0f}'.replace(',','.'))
-            st.dataframe(comparison.rename(columns={'codigo':'Código','descripcion':'Producto'}),hide_index=True,use_container_width=True)
-            st.caption('La diferencia entre fechas no representa necesariamente ventas: también puede incluir producción, entregas, devoluciones y ajustes.')
-with s4:
-    snaps=stock_snapshots()
-    if snaps.empty:st.info('No hay registros guardados todavía.')
-    else:
-        st.dataframe(snaps[['id','fecha_stock','fecha_carga','archivo','origen','observaciones']].rename(columns={'id':'Registro','fecha_stock':'Fecha stock','fecha_carga':'Fecha carga','archivo':'Archivo','origen':'Origen','observaciones':'Observaciones'}),hide_index=True,use_container_width=True)
-        export=io.BytesIO()
+            profitability = read_profitability(profitability_file)
+            valid = profitability[profitability['ESTADO'] == 'Válido'].copy()
+            p1,p2,p3 = st.columns(3)
+            p1.metric('Productos registrados', str(len(profitability)))
+            p2.metric('Productos con costo válido', str(len(valid)))
+            p3.metric('Productos para revisar', str(len(profitability)-len(valid)))
+            if len(valid) < len(profitability):
+                st.warning('Los productos sin costo positivo, precio válido o margen positivo no se utilizan en la simulación. No se supone que su fabricación sea gratuita.')
+            st.dataframe(profitability, use_container_width=True, hide_index=True,
+                         column_config={'MARGEN INFORMADO': st.column_config.NumberColumn('Margen informado',format='%.2f'),
+                                        'MARGEN CALCULADO (%)': st.column_config.NumberColumn('Margen calculado (%)',format='%.2f')})
+            st.subheader('Simulación por producto')
+            st.caption('Elegí un producto y una cantidad. Se calcula el capital necesario y la ganancia potencial si se venden todos los bultos. No es una orden de fabricación.')
+            if not valid.empty:
+                chosen = st.selectbox('Producto a simular', valid['PRODUCTO'].tolist(), key='sim_product', help='Solo aparecen productos con costo y precio válidos y ganancia positiva.')
+                qty = st.number_input('Bultos a fabricar (simulación)', min_value=0, max_value=1000000, value=100, step=10,
+                                      help='Cantidad hipotética. Cuando carguemos pedidos y stock, usaremos la necesidad real.')
+                item = valid[valid['PRODUCTO'] == chosen].iloc[0]
+                investment = float(qty) * float(item['COSTO POR BULTO'])
+                potential_sales = float(qty) * float(item['PRECIO POR BULTO'])
+                potential_profit = potential_sales - investment
+                s1,s2,s3 = st.columns(3)
+                s1.metric('Inversión requerida', money(investment))
+                s2.metric('Venta potencial', money(potential_sales))
+                s3.metric('Ganancia bruta potencial', money(potential_profit))
+                if 'analysis' in st.session_state:
+                    fc,exc,cc,rr,hh,res,start = st.session_state['analysis']
+                    fc = fc.copy()
+                    fc['FECHA COBRANZA'] = pd.to_datetime(fc['FECHA COBRANZA'])
+                    horizon_end = start + pd.Timedelta(days=hh)
+                    within = fc[fc['FECHA COBRANZA'].between(start,horizon_end)]
+                    available = max(0.0, cc + float(within['IMPORTE'].sum()) * (1-rr/100) - res)
+                    st.metric('Presupuesto preliminar según cobranzas', money(available))
+                    if investment > available:
+                        st.warning('Esta simulación supera el presupuesto preliminar de fabricación calculado con las cobranzas.')
+                    else:
+                        st.success('Esta simulación entra en el presupuesto preliminar, antes de descontar egresos y otras obligaciones.')
+                    if float(item['COSTO POR BULTO']) > 0:
+                        st.caption(f'Con ese presupuesto, el máximo teórico de este producto sería {int(available // float(item["COSTO POR BULTO"])):,} bultos, sin fabricar otros productos ni considerar demanda.'.replace(',', '.'))
+                else:
+                    st.info('Presioná «Analizar cobranzas» arriba para comparar esta inversión con el dinero proyectado.')
+            output_profit = io.BytesIO()
+            with pd.ExcelWriter(output_profit, engine='xlsxwriter') as writer:
+                profitability.to_excel(writer, sheet_name='Rentabilidad por bulto', index=False)
+            st.download_button('📥 Descargar análisis de rentabilidad', output_profit.getvalue(),
+                               file_name='produccion_cc_rentabilidad.xlsx',
+                               help='Exporta costos, precios, márgenes calculados y advertencias de validación.')
+        except Exception as exc:
+            st.error('No se pudo interpretar el Excel de rentabilidad: ' + str(exc))
+
+
+
+with main_formulas:
+    st.header('🧪 Fórmulas y rendimientos')
+    st.caption('El plan utiliza el rendimiento Bejerman (incluye merma). Solo se admiten elaboraciones completas. Cada edición genera una versión nueva y conserva las anteriores.')
+
+    def formulas_db():
         with sqlite3.connect(store_path()) as con:
-            all_details=pd.read_sql_query('SELECT c.id AS registro,c.fecha_stock,d.codigo,d.descripcion,d.bultos FROM stock_cargas c JOIN stock_detalle d ON d.carga_id=c.id ORDER BY c.fecha_stock,c.id,d.codigo',con)
-        with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
-            snaps.to_excel(writer,sheet_name='Cargas',index=False)
-            all_details.to_excel(writer,sheet_name='Stock historico',index=False)
-        st.download_button('📥 Descargar historial de stock (Excel)',export.getvalue(),file_name='historial_stock_cc.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',help='Guardá este respaldo fuera de Streamlit: el historial local no es permanente.')
-        st.caption('Cada carga es una fotografía completa. Las versiones anteriores se conservan; no se reemplazan.')
-st.warning('⚠️ El historial de stock y fórmulas se guarda por ahora en SQLite local. Streamlit Cloud puede borrar esa información al reiniciar o redesplegar. Descargá respaldos y conectemos almacenamiento permanente antes de usarlo operativamente.')
+            con.execute('CREATE TABLE IF NOT EXISTS formulas (codigo TEXT, version INTEGER, producto TEXT, rendimiento_bejerman REAL, rendimiento_teorico REAL, observaciones TEXT, creado TEXT, origen TEXT, PRIMARY KEY(codigo,version))')
+            con.execute('CREATE TABLE IF NOT EXISTS formula_ingredientes (codigo TEXT, version INTEGER, posicion INTEGER, grupo TEXT, ingrediente TEXT, cantidad REAL, unidad TEXT, brix REAL, PRIMARY KEY(codigo,version,posicion))')
+
+    def formula_versions():
+        with sqlite3.connect(store_path()) as con:
+            return pd.read_sql_query('SELECT * FROM formulas ORDER BY producto,version DESC',con)
+
+    def formula_ingredients(code,version):
+        with sqlite3.connect(store_path()) as con:
+            return pd.read_sql_query('SELECT grupo,ingrediente,cantidad,unidad,brix FROM formula_ingredientes WHERE codigo=? AND version=? ORDER BY posicion',con,params=(code,int(version)))
+
+    def save_formula(code,product,bejerman,theoretical,notes,ingredients,origin):
+        code=str(code).strip().upper();product=str(product).strip()
+        if not code or not product: raise ValueError('Completá el código y el nombre del producto.')
+        if not np.isfinite(bejerman) or bejerman<=0: raise ValueError('El rendimiento Bejerman debe ser mayor que cero.')
+        if ingredients.empty: raise ValueError('La fórmula debe tener ingredientes.')
+        data=[]
+        for _,r in ingredients.iterrows():
+            name=str(r.get('ingrediente','')).strip()
+            if not name or name.lower()=='nan': continue
+            qty=pd.to_numeric(r.get('cantidad'),errors='coerce')
+            if pd.isna(qty) or qty<0: raise ValueError('Revisá las cantidades: deben ser números no negativos.')
+            brix=pd.to_numeric(r.get('brix'),errors='coerce')
+            data.append((str(r.get('grupo','') or ''),name,float(qty),str(r.get('unidad','') or ''),None if pd.isna(brix) else float(brix)))
+        if not data: raise ValueError('No hay ingredientes válidos.')
+        with sqlite3.connect(store_path()) as con:
+            last=con.execute('SELECT MAX(version) FROM formulas WHERE codigo=?',(code,)).fetchone()[0]
+            version=1 if last is None else last+1
+            con.execute('INSERT INTO formulas VALUES (?,?,?,?,?,?,?,?)',(code,version,product,float(bejerman),None if pd.isna(theoretical) else float(theoretical),notes,datetime.now().isoformat(timespec='seconds'),origin))
+            con.executemany('INSERT INTO formula_ingredientes VALUES (?,?,?,?,?,?,?,?)',[(code,version,i,*r) for i,r in enumerate(data)])
+        return version
+
+    def parse_formula_excel(upload):
+        book=pd.ExcelFile(upload)
+        raw=pd.read_excel(book,sheet_name=0,header=None)
+        def cell(r,c):
+            return raw.iat[r,c] if r<len(raw) and c<len(raw.columns) else None
+        code=None;name=None;revision=None;bej=None;theo=None;items=[];in_table=False;group=''
+        for i in range(len(raw)):
+            vals=[clean(v) if pd.notna(v) else '' for v in raw.iloc[i].tolist()]
+            if 'VERSION' in vals and 'CODIGO' in vals:
+                revision=cell(i+1,vals.index('VERSION'));code=cell(i+1,vals.index('CODIGO'))
+            if any('MERMELADA' in v or 'JUGO' in v or 'DULCE' in v for v in vals[:2]) and name is None:
+                name=cell(i,0)
+            label=vals[0] if vals else ''
+            if 'RENDIMIENTO BEJERMAN' in label:bej=pd.to_numeric(cell(i,2),errors='coerce')
+            if label=='RENDIMIENTO TEORICO':theo=pd.to_numeric(cell(i,2),errors='coerce')
+            if len(vals)>3 and vals[1]=='INGREDIENTE' and vals[2]=='CANTIDAD':in_table=True;continue
+            if in_table:
+                if 'MASA TOTAL' in label or 'DATOS FISICOQUIMICOS' in label:in_table=False;continue
+                ingredient=cell(i,1);qty=pd.to_numeric(cell(i,2),errors='coerce')
+                if pd.notna(cell(i,0)) and str(cell(i,0)).strip():group=str(cell(i,0)).strip()
+                if pd.notna(ingredient) and str(ingredient).strip() and pd.notna(qty):
+                    brix=pd.to_numeric(cell(i,4),errors='coerce')
+                    items.append({'grupo':group,'ingrediente':str(ingredient).strip(),'cantidad':float(qty),'unidad':str(cell(i,3) or ''),'brix':None if pd.isna(brix) else float(brix)})
+        if not code or pd.isna(bej) or not items:
+            raise ValueError('No pude encontrar código, rendimiento Bejerman e ingredientes. Revisá que el archivo tenga el formato del modelo.')
+        return {'codigo':str(code).strip(),'producto':str(name or code).strip(),'revision_original':revision,'bejerman':float(bej),'teorico':float(theo) if pd.notna(theo) else 0.,'ingredientes':pd.DataFrame(items)}
+
+    formulas_db()
+    f1,f2,f3=st.tabs(['📥 Importar fórmula','📚 Fórmulas e historial','✏️ Editar y simular'])
+    with f1:
+        formula_file=st.file_uploader('Subir fórmula de elaboración (.xlsx)',type=['xlsx','xls'],key='formula_upload',help='Subí un Excel de fórmula como el modelo de Mermelada Stevia Arándano. Se leerán ingredientes, código y rendimiento Bejerman.')
+        if formula_file:
+            try:
+                parsed=parse_formula_excel(formula_file)
+                st.write(f"**{parsed['producto']}** · Código {parsed['codigo']} · Revisión del Excel: {parsed['revision_original']}")
+                x,y=st.columns(2)
+                x.metric('Rendimiento Bejerman (packs)',f"{parsed['bejerman']:,.2f}")
+                y.metric('Rendimiento teórico (packs)',f"{parsed['teorico']:,.2f}")
+                st.dataframe(parsed['ingredientes'],hide_index=True,use_container_width=True)
+                import_note=st.text_input('Observaciones de importación',key='formula_import_note',help='Anotá el motivo de la carga o la revisión de la fórmula.')
+                if st.button('Guardar fórmula como nueva versión',type='primary',key='formula_import_save'):
+                    version=save_formula(parsed['codigo'],parsed['producto'],parsed['bejerman'],parsed['teorico'],import_note,parsed['ingredientes'],f'Excel: {formula_file.name}; revisión origen {parsed["revision_original"]}')
+                    st.success(f'Fórmula guardada. Versión interna {version}. Se conservaron las versiones anteriores.')
+            except Exception as exc:st.error('No se pudo importar la fórmula: '+str(exc))
+    with f2:
+        versions=formula_versions()
+        if versions.empty:st.info('Todavía no hay fórmulas guardadas. Importá la primera desde Excel.')
+        else:
+            latest=versions.sort_values('version').drop_duplicates('codigo',keep='last')
+            st.subheader('Fórmulas vigentes')
+            st.dataframe(latest[['codigo','producto','version','rendimiento_bejerman','rendimiento_teorico','creado']],hide_index=True,use_container_width=True)
+            st.subheader('Historial de revisiones')
+            st.dataframe(versions[['codigo','producto','version','rendimiento_bejerman','observaciones','creado','origen']],hide_index=True,use_container_width=True)
+            export=io.BytesIO()
+            with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
+                versions.to_excel(writer,sheet_name='Versiones',index=False)
+                with sqlite3.connect(store_path()) as con:
+                    pd.read_sql_query('SELECT * FROM formula_ingredientes',con).to_excel(writer,sheet_name='Ingredientes',index=False)
+            st.download_button('📥 Descargar respaldo de fórmulas',export.getvalue(),file_name='respaldo_formulas_cc.xlsx',help='Guardá una copia externa: el almacenamiento local de Streamlit Cloud puede perderse al reiniciar.')
+    with f3:
+        versions=formula_versions()
+        if versions.empty:st.info('Importá una fórmula para habilitar su edición y simulación.')
+        else:
+            options=versions.sort_values('version').drop_duplicates('codigo',keep='last')
+            selected_code=st.selectbox('Producto / código',options['codigo'].tolist(),format_func=lambda c:f"{options.loc[options.codigo==c,'producto'].iloc[0]} ({c})",key='formula_code')
+            relevant=versions[versions.codigo==selected_code]
+            chosen_version=st.selectbox('Versión para consultar o editar',relevant.version.tolist(),key='formula_version')
+            base=relevant[relevant.version==chosen_version].iloc[0]
+            ingredients=formula_ingredients(selected_code,chosen_version)
+            with st.form('formula_edit_form'):
+                new_product=st.text_input('Nombre del producto',value=base['producto'])
+                new_bej=st.number_input('Rendimiento Bejerman (packs por elaboración)',min_value=0.01,value=float(base['rendimiento_bejerman']),format='%.4f',help='Rendimiento con merma. Es el utilizado para calcular elaboraciones completas.')
+                new_theo=st.number_input('Rendimiento teórico (referencia)',min_value=0.0,value=float(base['rendimiento_teorico'] or 0),format='%.4f')
+                edited=st.data_editor(ingredients,num_rows='dynamic',hide_index=True,use_container_width=True,key=f'edit_{selected_code}_{chosen_version}',column_config={'cantidad':st.column_config.NumberColumn('Cantidad',min_value=0),'ingrediente':st.column_config.TextColumn('Ingrediente',required=True)})
+                edit_note=st.text_input('Motivo del cambio / observaciones',help='El historial conserva esta nota junto con la fecha de la nueva versión.')
+                submitted=st.form_submit_button('Guardar cambios como nueva versión',type='primary')
+            if submitted:
+                try:
+                    if not edit_note.strip():raise ValueError('Indicá el motivo de la modificación para conservar la trazabilidad.')
+                    new_ver=save_formula(selected_code,new_product,new_bej,new_theo,edit_note,edited,f'Edición de versión {chosen_version}')
+                    st.success(f'Nueva versión {new_ver} guardada. La versión {chosen_version} permanece en el historial.')
+                except Exception as exc:st.error(str(exc))
+            st.subheader('Simular necesidad de elaboraciones completas')
+            demand=st.number_input('Bultos necesarios (después de descontar stock)',min_value=0,max_value=1000000,value=150,step=1,key='formula_demand')
+            # Se descartan fracciones: no se pueden despachar packs incompletos.
+            usable=int(np.floor(float(base['rendimiento_bejerman'])))
+            if usable<1:st.warning('El rendimiento Bejerman es menor a un bulto completo. Revisá la unidad de medida.')
+            else:
+                batches=int(np.ceil(demand/usable))
+                produced=batches*usable
+                a,b,c=st.columns(3)
+                a.metric('Elaboraciones completas',str(batches))
+                b.metric('Bultos utilizables',str(produced))
+                c.metric('Excedente estimado',str(produced-demand))
+                st.caption(f'Se toman {usable} bultos completos por elaboración (rendimiento Bejerman {float(base["rendimiento_bejerman"]):.2f}). No se permiten elaboraciones parciales. Esta simulación no descuenta materias primas ni presupuesto.')
+
+    st.warning('Importante: el historial de fórmulas usa una base SQLite local. En Streamlit Cloud puede perderse al reiniciar o redesplegar. Descargá respaldos y conectemos una base de datos persistente antes de usarlo como registro definitivo.')
+
+
+
+with main_stock:
+    # ─── STOCK DE PRODUCTOS TERMINADOS: FOTOGRAFÍAS POR FECHA ───
+    st.divider()
+    st.header('📦 Stock e historial')
+    st.caption('Stock expresado en bultos. Cada carga guarda una fotografía completa de las existencias; no se suman stocks de diferentes fechas.')
+
+    def init_stock_db():
+        with sqlite3.connect(store_path()) as con:
+            con.execute('CREATE TABLE IF NOT EXISTS stock_cargas (id INTEGER PRIMARY KEY AUTOINCREMENT, fecha_stock TEXT NOT NULL, fecha_carga TEXT NOT NULL, archivo TEXT NOT NULL, firma TEXT UNIQUE NOT NULL, origen TEXT NOT NULL, observaciones TEXT)')
+            con.execute('CREATE TABLE IF NOT EXISTS stock_detalle (carga_id INTEGER NOT NULL, codigo TEXT NOT NULL, descripcion TEXT NOT NULL, bultos REAL NOT NULL, PRIMARY KEY(carga_id,codigo), FOREIGN KEY(carga_id) REFERENCES stock_cargas(id))')
+
+    def parse_stock_excel(upload):
+        book=pd.ExcelFile(upload)
+        for sheet in book.sheet_names:
+            raw=pd.read_excel(book,sheet_name=sheet,header=None,dtype=object)
+            for i in range(min(len(raw),35)):
+                labels=[clean(v) for v in raw.iloc[i].tolist()]
+                code_col=next((j for j,v in enumerate(labels) if v in ('COD','CODIGO','COD.','ARTICULO')),None)
+                name_col=next((j for j,v in enumerate(labels) if v in ('DESCRIPCION','DESCRIPCIÓN','PRODUCTO','DETALLE')),None)
+                qty_col=next((j for j,v in enumerate(labels) if v in ('STOCK','EXISTENCIA','EXISTENCIAS','CANTIDAD')),None)
+                if None in (code_col,name_col,qty_col):continue
+                data=raw.iloc[i+1:,[code_col,name_col,qty_col]].copy()
+                data.columns=['codigo','descripcion','bultos']
+                data['codigo']=data['codigo'].apply(lambda v: str(v).strip().upper() if pd.notna(v) else '')
+                data['descripcion']=data['descripcion'].fillna('').astype(str).str.strip()
+                data['bultos']=data['bultos'].apply(parse_amount)
+                data=data[(data.codigo!='') & (data.descripcion!='') & data.bultos.notna()].copy()
+                data=data[~data.codigo.str.contains(r'^(TOTAL|SUBTOTAL|COD)$',case=False,regex=True)]
+                if data.empty:continue
+                if data.codigo.duplicated().any():
+                    repeated=', '.join(data.loc[data.codigo.duplicated(),'codigo'].head(5))
+                    raise ValueError(f'El archivo tiene códigos repetidos ({repeated}). Revisá el reporte antes de guardarlo.')
+                if (data.bultos<0).any():
+                    st.warning('El archivo contiene stock negativo. Se conservará tal como figura en Bejerman y se marcará para revisión.')
+                return data.sort_values('codigo').reset_index(drop=True),sheet
+        raise ValueError('No encontré las columnas COD, DESCRIPCION y STOCK. Revisá que el archivo sea el reporte de stock de Bejerman.')
+
+    def stock_snapshots():
+        with sqlite3.connect(store_path()) as con:
+            return pd.read_sql_query('SELECT * FROM stock_cargas ORDER BY fecha_stock DESC, id DESC',con)
+
+    def stock_details(snapshot_id):
+        with sqlite3.connect(store_path()) as con:
+            return pd.read_sql_query('SELECT codigo,descripcion,bultos FROM stock_detalle WHERE carga_id=? ORDER BY codigo',con,params=(int(snapshot_id),))
+
+    def save_stock(data,date_value,filename,origin='Excel',notes=''):
+        normalized=data.sort_values('codigo').copy()
+        payload=f"{date_value.isoformat()}\n"+normalized[['codigo','descripcion','bultos']].to_csv(index=False,float_format='%.6f')
+        fingerprint=hashlib.sha256(payload.encode('utf-8')).hexdigest()
+        with sqlite3.connect(store_path()) as con:
+            if con.execute('SELECT 1 FROM stock_cargas WHERE firma=?',(fingerprint,)).fetchone():return None
+            cur=con.execute('INSERT INTO stock_cargas (fecha_stock,fecha_carga,archivo,firma,origen,observaciones) VALUES (?,?,?,?,?,?)',(date_value.isoformat(),datetime.now().isoformat(timespec='seconds'),filename,fingerprint,origin,notes))
+            con.executemany('INSERT INTO stock_detalle (carga_id,codigo,descripcion,bultos) VALUES (?,?,?,?)',[(cur.lastrowid,str(r.codigo),str(r.descripcion),float(r.bultos)) for r in normalized.itertuples(index=False)])
+            return cur.lastrowid
+
+    init_stock_db()
+    s1,s2,s3,s4=st.tabs(['📥 Cargar stock','📦 Stock actual','📊 Comparar fechas','📚 Historial y respaldo'])
+    with s1:
+        st.info('Subí el reporte de productos terminados de Bejerman en formato .xlsx. La fecha representa cuándo se midió el stock, no cuándo se subió el archivo.')
+        stock_file=st.file_uploader('Excel de stock (.xlsx)',type=['xlsx'],key='stock_upload',help='Reporte de Bejerman con COD, DESCRIPCION y STOCK. Las cantidades están expresadas en bultos.')
+        stock_date=st.date_input('Fecha correspondiente al stock',value=datetime(2026,10,9).date(),key='stock_date',help='Elegí la fecha del reporte. Cada fecha puede tener distintas versiones si se corrige el stock.')
+        stock_notes=st.text_input('Observaciones (opcional)',key='stock_notes',help='Por ejemplo: cierre del día, recuento físico o ajuste del reporte.')
+        if stock_file is not None:
+            try:
+                preview,sheet=parse_stock_excel(stock_file)
+                c1,c2,c3=st.columns(3)
+                c1.metric('Productos',len(preview))
+                c2.metric('Con stock positivo',int((preview.bultos>0).sum()))
+                c3.metric('Bultos netos',f'{preview.bultos.sum():,.0f}'.replace(',','.'))
+                st.dataframe(preview.rename(columns={'codigo':'Código','descripcion':'Producto','bultos':'Stock (bultos)'}),hide_index=True,use_container_width=True)
+                if st.button('Guardar fotografía de stock',type='primary',key='stock_save',help='Guarda una nueva fotografía completa. Si ya existe exactamente la misma carga para esa fecha, no se duplica.'):
+                    result=save_stock(preview,stock_date,stock_file.name,notes=stock_notes)
+                    if result is None:st.info('Esta fotografía de stock ya estaba guardada para esa fecha. No se duplicó.')
+                    else:st.success(f'Stock del {stock_date.strftime("%d/%m/%Y")} guardado como registro #{result}.')
+            except Exception as exc:st.error(f'No pude interpretar el Excel de stock: {exc}')
+    with s2:
+        snaps=stock_snapshots()
+        if snaps.empty:st.info('Todavía no hay stock guardado. Cargá el primer Excel en la pestaña anterior.')
+        else:
+            latest=snaps.iloc[0]
+            current=stock_details(latest.id)
+            st.caption(f'Última fotografía: {pd.to_datetime(latest.fecha_stock).strftime("%d/%m/%Y")} · registro #{int(latest.id)} · {latest.archivo}')
+            a,b,c=st.columns(3)
+            a.metric('Productos',len(current))
+            b.metric('Con stock',int((current.bultos>0).sum()))
+            c.metric('Bultos netos',f'{current.bultos.sum():,.0f}'.replace(',','.'))
+            query=st.text_input('Buscar por código o producto',key='stock_search')
+            if query:
+                current=current[current.codigo.str.contains(query,case=False,regex=False)|current.descripcion.str.contains(query,case=False,regex=False)]
+            st.dataframe(current.rename(columns={'codigo':'Código','descripcion':'Producto','bultos':'Stock (bultos)'}),hide_index=True,use_container_width=True)
+            st.caption('El stock más reciente se selecciona por fecha del reporte, no por fecha de carga. Si existen varias versiones del mismo día, se utiliza la última guardada.')
+    with s3:
+        snaps=stock_snapshots()
+        if len(snaps)<2:st.info('Cuando guardes al menos dos fotografías, podrás comparar los cambios de stock por producto.')
+        else:
+            labels={int(r.id):f'{pd.to_datetime(r.fecha_stock).strftime("%d/%m/%Y")} · registro #{int(r.id)}' for r in snaps.itertuples(index=False)}
+            options=list(labels)
+            a,b=st.columns(2)
+            older=a.selectbox('Fotografía anterior',options,index=1,format_func=lambda k:labels[k],key='stock_compare_old')
+            newer=b.selectbox('Fotografía posterior',options,index=0,format_func=lambda k:labels[k],key='stock_compare_new')
+            if older==newer:st.warning('Elegí dos fotografías diferentes.')
+            else:
+                old=stock_details(older).rename(columns={'bultos':'Stock anterior','descripcion':'Descripción anterior'})
+                new=stock_details(newer).rename(columns={'bultos':'Stock nuevo'})
+                comparison=old.merge(new,on='codigo',how='outer')
+                comparison['descripcion']=comparison['descripcion'].fillna(comparison['Descripción anterior'])
+                comparison['Stock anterior']=comparison['Stock anterior'].fillna(0)
+                comparison['Stock nuevo']=comparison['Stock nuevo'].fillna(0)
+                comparison['Diferencia']=comparison['Stock nuevo']-comparison['Stock anterior']
+                comparison=comparison[['codigo','descripcion','Stock anterior','Stock nuevo','Diferencia']].sort_values('Diferencia')
+                st.metric('Variación neta de bultos',f'{comparison.Diferencia.sum():+,.0f}'.replace(',','.'))
+                st.dataframe(comparison.rename(columns={'codigo':'Código','descripcion':'Producto'}),hide_index=True,use_container_width=True)
+                st.caption('La diferencia entre fechas no representa necesariamente ventas: también puede incluir producción, entregas, devoluciones y ajustes.')
+    with s4:
+        snaps=stock_snapshots()
+        if snaps.empty:st.info('No hay registros guardados todavía.')
+        else:
+            st.dataframe(snaps[['id','fecha_stock','fecha_carga','archivo','origen','observaciones']].rename(columns={'id':'Registro','fecha_stock':'Fecha stock','fecha_carga':'Fecha carga','archivo':'Archivo','origen':'Origen','observaciones':'Observaciones'}),hide_index=True,use_container_width=True)
+            export=io.BytesIO()
+            with sqlite3.connect(store_path()) as con:
+                all_details=pd.read_sql_query('SELECT c.id AS registro,c.fecha_stock,d.codigo,d.descripcion,d.bultos FROM stock_cargas c JOIN stock_detalle d ON d.carga_id=c.id ORDER BY c.fecha_stock,c.id,d.codigo',con)
+            with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
+                snaps.to_excel(writer,sheet_name='Cargas',index=False)
+                all_details.to_excel(writer,sheet_name='Stock historico',index=False)
+            st.download_button('📥 Descargar historial de stock (Excel)',export.getvalue(),file_name='historial_stock_cc.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',help='Guardá este respaldo fuera de Streamlit: el historial local no es permanente.')
+            st.caption('Cada carga es una fotografía completa. Las versiones anteriores se conservan; no se reemplazan.')
+    st.warning('⚠️ El historial de stock y fórmulas se guarda por ahora en SQLite local. Streamlit Cloud puede borrar esa información al reiniciar o redesplegar. Descargá respaldos y conectemos almacenamiento permanente antes de usarlo operativamente.')
+
+
+
+# Distribución realizada: pedidos asignados ya entregados; pendientes son demanda no cubierta.
+def read_distribution(upload):
+    book = pd.ExcelFile(upload)
+    needed = {'Pendientes','Stock restante'}
+    missing = needed.difference(book.sheet_names)
+    if missing:
+        raise ValueError('Faltan pestañas del archivo de Distribución Inteligente: '+', '.join(sorted(missing)))
+    pending = pd.read_excel(book,sheet_name='Pendientes')
+    stock = pd.read_excel(book,sheet_name='Stock restante')
+    pending.columns = [str(c).strip().upper() for c in pending.columns]
+    stock.columns = [str(c).strip().upper() for c in stock.columns]
+    for df,required in [(pending,['CODIGO','DESCRIPCION','PENDIENTE']),(stock,['CODIGO','DESCRIPCION','STOCK RESTANTE'])]:
+        missing_cols = [c for c in required if c not in df.columns]
+        if missing_cols: raise ValueError('Faltan columnas: '+', '.join(missing_cols))
+        df['CODIGO'] = df['CODIGO'].astype(str).str.strip().str.upper()
+        df.drop(df[~df['CODIGO'].str.match(r'^[A-Z0-9_-]+$')].index,inplace=True)
+    pending['PENDIENTE'] = pd.to_numeric(pending['PENDIENTE'],errors='coerce').fillna(0).clip(lower=0)
+    stock['STOCK RESTANTE'] = pd.to_numeric(stock['STOCK RESTANTE'],errors='coerce').fillna(0).clip(lower=0)
+    pending = pending[pending['PENDIENTE']>0].copy()
+    return pending,stock
+
+
+def distribution_plan(pending,stock):
+    demand = pending.groupby('CODIGO',as_index=False).agg(DESCRIPCION=('DESCRIPCION','first'),PENDIENTE=('PENDIENTE','sum'))
+    available = stock.groupby('CODIGO',as_index=False)['STOCK RESTANTE'].sum()
+    plan = demand.merge(available,on='CODIGO',how='left')
+    plan['STOCK RESTANTE'] = plan['STOCK RESTANTE'].fillna(0)
+    plan['NECESIDAD NETA'] = (plan['PENDIENTE']-plan['STOCK RESTANTE']).clip(lower=0)
+    return plan.sort_values(['NECESIDAD NETA','PENDIENTE'],ascending=False)
+
+
+with main_demand:
+    st.header('🚚 Demanda y distribución')
+    st.caption('Importá el Excel exportado por Distribución Inteligente CC después de que se haya realizado la distribución. No se vuelven a descontar los bultos entregados.')
+    distribution_file = st.file_uploader('Distribución completa (.xlsx)',type=['xlsx'],key='distribution_file',help='Archivo exportado por Distribución Inteligente, con las pestañas Pendientes y Stock restante.')
+    distribution_date = st.date_input('Fecha de distribución realizada',value=datetime.now(ZoneInfo('America/Argentina/Buenos_Aires')).date(),format='DD/MM/YYYY',key='distribution_date',help='Fecha efectiva de la distribución, no la fecha de carga del archivo.')
+    if distribution_file is not None:
+        try:
+            pending, remaining = read_distribution(distribution_file)
+            plan = distribution_plan(pending,remaining)
+            st.info('Se toma el stock restante del archivo como stock posterior a esa distribución. Si existe un inventario físico más reciente, ese debe prevalecer para el plan definitivo.')
+            a,b,c,d=st.columns(4)
+            a.metric('Bultos pendientes',f"{pending['PENDIENTE'].sum():,.0f}")
+            b.metric('Stock posterior a distribución',f"{remaining['STOCK RESTANTE'].sum():,.0f}")
+            c.metric('Necesidad neta',f"{plan['NECESIDAD NETA'].sum():,.0f}")
+            d.metric('Productos con faltante',str((plan['NECESIDAD NETA']>0).sum()))
+            p1,p2,p3=st.tabs(['📋 Necesidad por producto','👥 Pendientes por cliente','📦 Stock posterior'])
+            with p1: st.dataframe(plan,hide_index=True,use_container_width=True)
+            with p2: st.dataframe(pending,hide_index=True,use_container_width=True)
+            with p3: st.dataframe(remaining,hide_index=True,use_container_width=True)
+            st.caption('La necesidad neta se calcula por código: máximo entre 0 y pendientes menos stock restante. Aún no equivale a una orden de fabricación: falta cruzarla con fórmulas, costos y caja.')
+            if st.button('Guardar distribución en historial',key='save_distribution',help='Guarda la fotografía de pendientes y stock posterior a la distribución, sin repetir una carga idéntica.'):
+                payload = distribution_file.getvalue()
+                digest = hashlib.sha256(payload).hexdigest()
+                with sqlite3.connect(store_path()) as conn:
+                    conn.execute('CREATE TABLE IF NOT EXISTS distribuciones (hash TEXT PRIMARY KEY, fecha TEXT NOT NULL, nombre TEXT NOT NULL, fecha_carga TEXT NOT NULL, pendientes TEXT NOT NULL, stock TEXT NOT NULL)')
+                    cursor = conn.execute('INSERT OR IGNORE INTO distribuciones VALUES (?,?,?,?,?,?)',(digest,str(distribution_date),distribution_file.name,datetime.now().isoformat(),pending.to_json(orient='records',force_ascii=False),remaining.to_json(orient='records',force_ascii=False)))
+                    conn.commit()
+                    inserted=cursor.rowcount>0
+                if inserted: st.success('Distribución guardada en el historial local.')
+                else: st.info('Esta distribución ya estaba guardada. No se duplicó.')
+            output=io.BytesIO()
+            with pd.ExcelWriter(output,engine='xlsxwriter') as writer:
+                plan.to_excel(writer,sheet_name='Necesidad neta',index=False)
+                pending.to_excel(writer,sheet_name='Pendientes',index=False)
+                remaining.to_excel(writer,sheet_name='Stock posterior',index=False)
+            st.download_button('📥 Descargar análisis de demanda',output.getvalue(),file_name='produccion_cc_demanda_distribucion.xlsx')
+        except Exception as exc:
+            st.error('No se pudo interpretar el archivo de distribución: '+str(exc))
+    with sqlite3.connect(store_path()) as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS distribuciones (hash TEXT PRIMARY KEY, fecha TEXT NOT NULL, nombre TEXT NOT NULL, fecha_carga TEXT NOT NULL, pendientes TEXT NOT NULL, stock TEXT NOT NULL)')
+        stored = pd.read_sql_query('SELECT fecha AS FECHA, nombre AS ARCHIVO, fecha_carga AS CARGADO FROM distribuciones ORDER BY fecha DESC, fecha_carga DESC',conn)
+    if not stored.empty:
+        with st.expander('📚 Distribuciones guardadas (almacenamiento provisional)'):
+            st.dataframe(stored,hide_index=True,use_container_width=True)
+    st.warning('Los registros guardados localmente pueden perderse al reiniciar Streamlit Cloud. Para un historial definitivo falta conectar una base de datos persistente.')
