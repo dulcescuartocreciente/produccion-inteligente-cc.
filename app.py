@@ -3,6 +3,8 @@ import calendar
 import html
 import hashlib
 import sqlite3
+import zipfile
+import os
 import re
 import unicodedata
 from datetime import datetime, timedelta
@@ -531,39 +533,20 @@ with main_formulas:
     st.header('🧪 Fórmulas y rendimientos')
     st.caption('El plan utiliza el rendimiento Bejerman (incluye merma). Solo se admiten elaboraciones completas. Cada edición genera una versión nueva y conserva las anteriores.')
 
+    from formula_store_cc import FormulaStore, formula_database_url
+    formula_store = FormulaStore(formula_database_url(), store_path())
+
     def formulas_db():
-        with sqlite3.connect(store_path()) as con:
-            con.execute('CREATE TABLE IF NOT EXISTS formulas (codigo TEXT, version INTEGER, producto TEXT, rendimiento_bejerman REAL, rendimiento_teorico REAL, observaciones TEXT, creado TEXT, origen TEXT, PRIMARY KEY(codigo,version))')
-            con.execute('CREATE TABLE IF NOT EXISTS formula_ingredientes (codigo TEXT, version INTEGER, posicion INTEGER, grupo TEXT, ingrediente TEXT, cantidad REAL, unidad TEXT, brix REAL, PRIMARY KEY(codigo,version,posicion))')
+        formula_store.initialize()
 
     def formula_versions():
-        with sqlite3.connect(store_path()) as con:
-            return pd.read_sql_query('SELECT * FROM formulas ORDER BY producto,version DESC',con)
+        return formula_store.versions()
 
     def formula_ingredients(code,version):
-        with sqlite3.connect(store_path()) as con:
-            return pd.read_sql_query('SELECT grupo,ingrediente,cantidad,unidad,brix FROM formula_ingredientes WHERE codigo=? AND version=? ORDER BY posicion',con,params=(code,int(version)))
+        return formula_store.ingredients(code,version)
 
     def save_formula(code,product,bejerman,theoretical,notes,ingredients,origin):
-        code=str(code).strip().upper();product=str(product).strip()
-        if not code or not product: raise ValueError('Completá el código y el nombre del producto.')
-        if not np.isfinite(bejerman) or bejerman<=0: raise ValueError('El rendimiento Bejerman debe ser mayor que cero.')
-        if ingredients.empty: raise ValueError('La fórmula debe tener ingredientes.')
-        data=[]
-        for _,r in ingredients.iterrows():
-            name=str(r.get('ingrediente','')).strip()
-            if not name or name.lower()=='nan': continue
-            qty=pd.to_numeric(r.get('cantidad'),errors='coerce')
-            if pd.isna(qty) or qty<0: raise ValueError('Revisá las cantidades: deben ser números no negativos.')
-            brix=pd.to_numeric(r.get('brix'),errors='coerce')
-            data.append((str(r.get('grupo','') or ''),name,float(qty),str(r.get('unidad','') or ''),None if pd.isna(brix) else float(brix)))
-        if not data: raise ValueError('No hay ingredientes válidos.')
-        with sqlite3.connect(store_path()) as con:
-            last=con.execute('SELECT MAX(version) FROM formulas WHERE codigo=?',(code,)).fetchone()[0]
-            version=1 if last is None else last+1
-            con.execute('INSERT INTO formulas VALUES (?,?,?,?,?,?,?,?)',(code,version,product,float(bejerman),None if pd.isna(theoretical) else float(theoretical),notes,datetime.now().isoformat(timespec='seconds'),origin))
-            con.executemany('INSERT INTO formula_ingredientes VALUES (?,?,?,?,?,?,?,?)',[(code,version,i,*r) for i,r in enumerate(data)])
-        return version
+        return formula_store.save(code,product,bejerman,theoretical,notes,ingredients,origin)
 
     def parse_formula_excel(upload):
         book=pd.ExcelFile(upload)
@@ -593,7 +576,11 @@ with main_formulas:
         return {'codigo':str(code).strip(),'producto':str(name or code).strip(),'revision_original':revision,'bejerman':float(bej),'teorico':float(theo) if pd.notna(theo) else 0.,'ingredientes':pd.DataFrame(items)}
 
     formulas_db()
-    f1,f2,f3=st.tabs(['📥 Importar fórmula','📚 Fórmulas e historial','✏️ Editar y simular'])
+    if formula_store.is_remote:
+        st.success('Fórmulas conectadas a PostgreSQL de Supabase: guardado permanente activo.')
+    else:
+        st.warning('Fórmulas en SQLite local (provisional). Configurá DATABASE_URL en Streamlit Secrets para guardarlas permanentemente en Supabase.')
+    f1,fzip,f2,f3=st.tabs(['📥 Importar fórmula','📦 Importar ZIP','📚 Fórmulas e historial','✏️ Editar y simular'])
     with f1:
         formula_file=st.file_uploader('Subir fórmula de elaboración (.xlsx)',type=['xlsx','xls'],key='formula_upload',help='Subí un Excel de fórmula como el modelo de Mermelada Stevia Arándano. Se leerán ingredientes, código y rendimiento Bejerman.')
         if formula_file:
@@ -607,8 +594,57 @@ with main_formulas:
                 import_note=st.text_input('Observaciones de importación',key='formula_import_note',help='Anotá el motivo de la carga o la revisión de la fórmula.')
                 if st.button('Guardar fórmula como nueva versión',type='primary',key='formula_import_save'):
                     version=save_formula(parsed['codigo'],parsed['producto'],parsed['bejerman'],parsed['teorico'],import_note,parsed['ingredientes'],f'Excel: {formula_file.name}; revisión origen {parsed["revision_original"]}')
-                    st.success(f'Fórmula guardada. Versión interna {version}. Se conservaron las versiones anteriores.')
+                    if version is None: st.info('Esta fórmula es idéntica a la última versión guardada; no se duplicó.')
+                    else: st.success(f'Fórmula guardada. Versión interna {version}. Se conservaron las versiones anteriores.')
             except Exception as exc:st.error('No se pudo importar la fórmula: '+str(exc))
+    with fzip:
+        st.subheader('Importación masiva de fórmulas desde ZIP')
+        st.caption('Acepta archivos .xlsx y .xls en carpetas dentro del ZIP. Revisa todas las fórmulas antes de guardar; solo incorpora las seleccionadas y evita duplicar fórmulas idénticas.')
+        zip_upload=st.file_uploader('Subir ZIP de fórmulas',type=['zip'],key='formulas_zip')
+        if zip_upload is not None:
+            try:
+                zip_bytes=zip_upload.getvalue()
+                if len(zip_bytes)>80*1024*1024:
+                    raise ValueError('El ZIP supera 80 MB. Dividilo en varios archivos.')
+                parsed_files=[]; issues=[]; seen_codes=set()
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+                    entries=[x for x in archive.infolist() if not x.is_dir() and x.filename.lower().endswith(('.xlsx','.xls')) and not Path(x.filename).name.startswith(('~$','._'))]
+                    if len(entries)>500:raise ValueError('El ZIP contiene más de 500 Excel. Dividilo en lotes.')
+                    if not entries:raise ValueError('El ZIP no contiene fórmulas Excel.')
+                    for entry in entries:
+                        try:
+                            if entry.file_size>20*1024*1024:raise ValueError('Excel mayor a 20 MB')
+                            raw=archive.read(entry)
+                            parsed=parse_formula_excel(io.BytesIO(raw))
+                            code=parsed['codigo'].strip().upper()
+                            if code in seen_codes:
+                                raise ValueError(f'Código {code} repetido en este ZIP. Revisá qué versión querés cargar.')
+                            seen_codes.add(code)
+                            parsed_files.append((entry.filename,parsed))
+                        except Exception as exc:
+                            issues.append({'Archivo':entry.filename,'Problema':str(exc)})
+                if issues:
+                    st.warning(f'{len(issues)} archivo(s) no se pudieron interpretar. No se guardarán.')
+                    st.dataframe(pd.DataFrame(issues),hide_index=True,use_container_width=True)
+                if parsed_files:
+                    preview_rows=[{'Archivo':filename,'Código':data['codigo'],'Producto':data['producto'],'Rendimiento Bejerman':data['bejerman'],'Ingredientes':len(data['ingredientes'])} for filename,data in parsed_files]
+                    st.dataframe(pd.DataFrame(preview_rows),hide_index=True,use_container_width=True)
+                    chosen=st.multiselect('Seleccioná las fórmulas a incorporar',options=[name for name,_ in parsed_files],default=[name for name,_ in parsed_files],key='zip_selected')
+                    note=st.text_input('Observaciones de la importación',key='zip_notes')
+                    if st.button('Guardar fórmulas seleccionadas',type='primary',key='zip_commit'):
+                        saved_count=0; skipped_count=0; errors=[]
+                        for filename,data in parsed_files:
+                            if filename not in chosen:continue
+                            try:
+                                version=save_formula(data['codigo'],data['producto'],data['bejerman'],data['teorico'],note,data['ingredientes'],f'ZIP: {zip_upload.name} / {filename}')
+                                if version is None:skipped_count+=1
+                                else:saved_count+=1
+                            except Exception as exc:errors.append({'Archivo':filename,'Problema':str(exc)})
+                        st.success(f'{saved_count} fórmula(s) guardadas. {skipped_count} sin cambios, omitidas.')
+                        if errors:st.dataframe(pd.DataFrame(errors),hide_index=True,use_container_width=True)
+            except (zipfile.BadZipFile,ValueError,RuntimeError) as exc:
+                st.error(f'No pude procesar el ZIP: {exc}')
+
     with f2:
         versions=formula_versions()
         if versions.empty:st.info('Todavía no hay fórmulas guardadas. Importá la primera desde Excel.')
@@ -621,8 +657,7 @@ with main_formulas:
             export=io.BytesIO()
             with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
                 versions.to_excel(writer,sheet_name='Versiones',index=False)
-                with sqlite3.connect(store_path()) as con:
-                    pd.read_sql_query('SELECT * FROM formula_ingredientes',con).to_excel(writer,sheet_name='Ingredientes',index=False)
+                formula_store.all_ingredients().to_excel(writer,sheet_name='Ingredientes',index=False)
             st.download_button('📥 Descargar respaldo de fórmulas',export.getvalue(),file_name='respaldo_formulas_cc.xlsx',help='Guardá una copia externa: el almacenamiento local de Streamlit Cloud puede perderse al reiniciar.')
     with f3:
         versions=formula_versions()
@@ -645,7 +680,8 @@ with main_formulas:
                 try:
                     if not edit_note.strip():raise ValueError('Indicá el motivo de la modificación para conservar la trazabilidad.')
                     new_ver=save_formula(selected_code,new_product,new_bej,new_theo,edit_note,edited,f'Edición de versión {chosen_version}')
-                    st.success(f'Nueva versión {new_ver} guardada. La versión {chosen_version} permanece en el historial.')
+                    if new_ver is None: st.info('No hay cambios respecto de la última versión; no se duplicó.')
+                    else: st.success(f'Nueva versión {new_ver} guardada. La versión {chosen_version} permanece en el historial.')
                 except Exception as exc:st.error(str(exc))
             st.subheader('Simular necesidad de elaboraciones completas')
             demand=st.number_input('Bultos necesarios (después de descontar stock)',min_value=0,max_value=1000000,value=150,step=1,key='formula_demand')
@@ -661,7 +697,10 @@ with main_formulas:
                 c.metric('Excedente estimado',str(produced-demand))
                 st.caption(f'Se toman {usable} bultos completos por elaboración (rendimiento Bejerman {float(base["rendimiento_bejerman"]):.2f}). No se permiten elaboraciones parciales. Esta simulación no descuenta materias primas ni presupuesto.')
 
-    st.warning('Importante: el historial de fórmulas usa una base SQLite local. En Streamlit Cloud puede perderse al reiniciar o redesplegar. Descargá respaldos y conectemos una base de datos persistente antes de usarlo como registro definitivo.')
+    if not formula_store.is_remote:
+        st.warning('Las fórmulas siguen en SQLite provisional. Configurá Supabase antes de importar el ZIP definitivo. Los otros historiales de la app (stock, rutas y distribución) aún usan SQLite local.')
+    else:
+        st.info('Las fórmulas se guardan permanentemente en Supabase. Los historiales de stock, rutas y distribución siguen siendo provisionales en SQLite local; se migrarán en una etapa posterior.')
 
 
 
