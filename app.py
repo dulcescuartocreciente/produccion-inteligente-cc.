@@ -294,8 +294,8 @@ with st.sidebar:
     reference_date=st.date_input('Fecha inicial de planificación',value=datetime.now().date(),format='DD/MM/YYYY',help='Fecha desde la cual se analizan las cobranzas proyectadas.')
     st.caption('Los egresos se incorporarán más adelante. Las cobranzas proyectadas no equivalen a dinero efectivamente recibido.')
 
-main_fin, main_profit, main_formulas, main_stock, main_demand = st.tabs([
-    '💰 Cobranzas y Cash Flow', '📊 Rentabilidad', '🧪 Fórmulas y rendimientos', '📦 Stock e historial', '🚚 Demanda y distribución'
+main_fin, main_profit, main_formulas, main_stock, main_demand, main_plan = st.tabs([
+    '💰 Cobranzas y Cash Flow', '📊 Rentabilidad', '🧪 Fórmulas y rendimientos', '📦 Stock e historial', '🚚 Demanda y distribución', '🏭 Plan de producción'
 ])
 
 with main_fin:
@@ -871,3 +871,142 @@ with main_demand:
         with st.expander('📚 Distribuciones guardadas (almacenamiento provisional)'):
             st.dataframe(stored,hide_index=True,use_container_width=True)
     st.warning('Los registros guardados localmente pueden perderse al reiniciar Streamlit Cloud. Para un historial definitivo falta conectar una base de datos persistente.')
+
+
+# ─── V11 · PLAN DE PRODUCCIÓN ORIENTADO A RENTABILIDAD ───
+with main_plan:
+    from optimizer_cc import optimize_batches
+    st.header('🏭 Plan de producción · máxima ganancia')
+    st.caption('Optimiza elaboraciones completas con demanda pendiente real, rendimiento Bejerman, costo por bulto y presupuesto. No supone que los excedentes se venden.')
+    st.info('Para empezar: cargá una distribución en «Demanda y distribución», costos en la barra lateral y las fórmulas en «Fórmulas y rendimientos».')
+
+    # Distribución subida en esta sesión; se permite recuperar la última carga guardada.
+    source_pending = source_stock = None
+    source_date = None
+    try:
+        if distribution_file is not None:
+            source_pending, source_stock = read_distribution(distribution_file)
+            source_date = str(distribution_date)
+        else:
+            with sqlite3.connect(store_path()) as con:
+                latest_distribution = con.execute('SELECT fecha,pendientes,stock FROM distribuciones ORDER BY fecha DESC, fecha_carga DESC LIMIT 1').fetchone()
+            if latest_distribution:
+                source_date=latest_distribution[0]
+                source_pending=pd.read_json(io.StringIO(latest_distribution[1]),orient='records')
+                source_stock=pd.read_json(io.StringIO(latest_distribution[2]),orient='records')
+    except Exception as exc:
+        st.error(f'No pude leer la distribución: {exc}')
+
+    if source_pending is None or source_stock is None:
+        st.warning('Falta importar o guardar una distribución realizada. Sin pedidos pendientes no podemos calcular rentabilidad respaldada por demanda.')
+    elif profitability_file is None:
+        st.warning('Falta subir el Excel de costos y precios por bulto en la barra lateral.')
+    else:
+        try:
+            needs=distribution_plan(source_pending,source_stock)
+            needs=needs[needs['NECESIDAD NETA']>0].copy()
+            prices=read_profitability(profitability_file)
+            versions=formula_versions()
+            if needs.empty:
+                st.success('No hay faltantes netos en la distribución seleccionada.')
+            elif versions.empty:
+                st.warning('Falta guardar fórmulas con rendimientos Bejerman. Importalas en su pestaña.')
+            else:
+                st.caption(f'Distribución de referencia: {source_date}. Si existe stock físico posterior, cargalo en «Stock e historial» y seleccioná su uso aquí.')
+                source_stock_date=pd.Timestamp(source_date).date()
+                snaps=stock_snapshots()
+                recent=snaps[pd.to_datetime(snaps.fecha_stock).dt.date>source_stock_date] if not snaps.empty else pd.DataFrame()
+                stock_option=st.radio('Stock para calcular faltantes',
+                    ['Stock posterior de la distribución']+(['Última fotografía Bejerman posterior a la distribución'] if not recent.empty else []),
+                    horizontal=True,key='v11_stock_choice')
+                if stock_option.startswith('Última'):
+                    snap=recent.iloc[0]
+                    physical=stock_details(snap.id)
+                    stock_by_code=physical.set_index('codigo')['bultos'].to_dict()
+                    grouped=source_pending.groupby('CODIGO',as_index=False).agg(DESCRIPCION=('DESCRIPCION','first'),PENDIENTE=('PENDIENTE','sum'))
+                    grouped['STOCK RESTANTE']=grouped.CODIGO.map(stock_by_code).fillna(0)
+                    grouped['NECESIDAD NETA']=(grouped.PENDIENTE-grouped['STOCK RESTANTE']).clip(lower=0)
+                    needs=grouped[grouped['NECESIDAD NETA']>0].copy()
+                    st.caption(f'Se usa fotografía Bejerman #{int(snap.id)} del {snap.fecha_stock}; no se descuenta de nuevo la distribución.')
+                latest_formula=versions.sort_values('version').drop_duplicates('codigo',keep='last')
+                formula_by_code=latest_formula.set_index('codigo').to_dict('index')
+                valid_prices=prices[prices.ESTADO=='Válido'].copy()
+                # Explicit mapping: profitability file has names but no product codes.
+                st.subheader('1. Vincular productos con costos y fórmulas')
+                st.caption('El archivo de rentabilidad no tiene códigos. Vinculá cada código con el producto correcto; el sistema nunca adivina esta relación.')
+                options=['— Sin vincular —']+valid_prices.PRODUCTO.tolist()
+                units_per_bulto=st.number_input('Packs del rendimiento Bejerman por cada bulto comercial',min_value=1,value=1,step=1,key='v11_packs_per_bulto',help='Si Bejerman expresa packs y cada bulto comercial contiene varios packs, ingresá cuántos packs forman un bulto. Si son equivalentes, dejá 1.')
+                mappings=[]
+                for _, row in needs.iterrows():
+                    code=str(row["CODIGO"])
+                    if code not in formula_by_code:continue
+                    with st.expander(f'{code} · {row["DESCRIPCION"]} · faltan {row["NECESIDAD NETA"]:,.0f} bultos',expanded=False):
+                        st.caption(f'Fórmula: {formula_by_code[code]["producto"]} · Bejerman: {formula_by_code[code]["rendimiento_bejerman"]:,.2f} packs/elaboración')
+                        selected=st.selectbox('Producto en Excel de rentabilidad',options,key=f'v11_match_{code}')
+                    if selected!='— Sin vincular —':
+                        mappings.append((code,selected))
+                duplicate_prices=pd.Series([x[1] for x in mappings]).duplicated().any() if mappings else False
+                if duplicate_prices:st.error('Hay productos de rentabilidad vinculados a más de un código. Corregí las relaciones antes de optimizar.')
+                missing_formula=needs[~needs.CODIGO.isin(formula_by_code)]
+                if not missing_formula.empty:
+                    st.warning(f'{len(missing_formula)} productos con faltantes no tienen fórmula vigente y quedan fuera del plan.')
+                    with st.expander('Ver productos sin fórmula'):
+                        st.dataframe(missing_formula,hide_index=True,use_container_width=True)
+                mapped=[]
+                for code,product in mappings:
+                    item=needs.loc[needs.CODIGO==code].iloc[0]
+                    cost_row=valid_prices.loc[valid_prices.PRODUCTO==product].iloc[0]
+                    formula=formula_by_code[code]
+                    mapped.append({'codigo':code,'descripcion':str(item.DESCRIPCION),'demanda_neta':float(item['NECESIDAD NETA']),
+                        'rendimiento':float(formula['rendimiento_bejerman'])/units_per_bulto,
+                        'costo_bulto':float(cost_row['COSTO POR BULTO']),'precio_bulto':float(cost_row['PRECIO POR BULTO'])})
+                st.subheader('2. Presupuesto para fabricar')
+                financial_budget=0.
+                if 'analysis' in st.session_state:
+                    fc,_,cc,rr,hh,res,start=st.session_state['analysis']
+                    end=start+pd.Timedelta(days=hh)
+                    dated=fc.copy();dated['FECHA COBRANZA']=pd.to_datetime(dated['FECHA COBRANZA'])
+                    usable=dated[dated['FECHA COBRANZA'].between(start,end)]
+                    financial_budget=max(0.,float(cc)+float(usable.IMPORTE.sum())*(1-float(rr)/100)-float(res))
+                    st.caption(f'Presupuesto proyectado hasta {end:%d/%m/%Y}, con riesgo y reserva incluidos. Las cobranzas futuras no son caja confirmada.')
+                else:
+                    st.warning('Todavía no analizaste cobranzas. Podés usar un presupuesto manual o ir a «Cobranzas y Cash Flow».')
+                budget_mode=st.radio('Origen del presupuesto',['Proyección de cobranzas','Presupuesto manual'],horizontal=True,key='v11_budget_mode')
+                manual=st.number_input('Presupuesto manual ($)',min_value=0.,value=0.,step=100000.,key='v11_manual_budget') if budget_mode=='Presupuesto manual' else 0.
+                if budget_mode=='Proyección de cobranzas' and 'analysis' not in st.session_state:
+                    st.warning('Analizá cobranzas o elegí presupuesto manual.')
+                else:
+                    gross_budget=financial_budget if budget_mode=='Proyección de cobranzas' else manual
+                    expenses=st.number_input('Egresos comprometidos antes de fabricar ($)',min_value=0.,value=0.,step=100000.,key='v11_expenses',help='Descontá proveedores, salarios, impuestos y otras obligaciones que no estén incluidas en el presupuesto.')
+                    net_budget=max(0.,gross_budget-expenses)
+                    st.metric('Presupuesto máximo para producción',money(net_budget))
+                    st.caption('Es un techo financiero, no una orden de compra. No contempla plazos de elaboración ni disponibilidad de insumos.')
+                    if st.button('⚙️ Optimizar producción',type='primary',use_container_width=True,key='v11_optimize',disabled=not mapped or duplicate_prices):
+                        plan_result,issues,summary=optimize_batches(pd.DataFrame(mapped),net_budget)
+                        st.session_state['v11_result']=(plan_result,issues,summary,net_budget,source_date,len(mapped),sum(float(x['demanda_neta']) for x in mapped))
+                    if 'v11_result' in st.session_state:
+                        plan_result,issues,summary,used_budget,used_date,mapped_count,mapped_demand=st.session_state['v11_result']
+                        st.subheader('3. Recomendación más rentable')
+                        st.caption(f'Resultado calculado con presupuesto {money(used_budget)} y distribución {used_date}. Presioná Optimizar nuevamente si modificás entradas.')
+                        a,b,c,d=st.columns(4)
+                        a.metric('Elaboraciones',str(summary.get('selected_batches',0)))
+                        b.metric('Inversión',money(summary['investment']))
+                        c.metric('Ganancia potencial',money(summary['profit']))
+                        d.metric('Saldo del presupuesto',money(max(0.,used_budget-summary['investment'])))
+                        st.caption(f'Estado: {summary["status"]}. La ganancia potencial descuenta el costo de toda la elaboración, incluso los bultos excedentes; solo reconoce ingresos por demanda respaldada.')
+                        if not plan_result.empty:
+                            st.dataframe(plan_result,hide_index=True,use_container_width=True)
+                            st.metric('Bultos pendientes aún sin cubrir entre los productos vinculados',f'{max(0,mapped_demand-plan_result["BULTOS VENDIBLES"].sum()):,.0f}')
+                            if plan_result['EXCEDENTE'].sum()>0:st.warning('El plan genera excedentes que quedan en stock y no se cuentan como ventas.')
+                            buff=io.BytesIO()
+                            with pd.ExcelWriter(buff,engine='xlsxwriter') as writer:
+                                plan_result.to_excel(writer,sheet_name='Elaboraciones recomendadas',index=False)
+                                pd.DataFrame(mapped).to_excel(writer,sheet_name='Datos de entrada',index=False)
+                                if not issues.empty:issues.to_excel(writer,sheet_name='Datos a revisar',index=False)
+                            st.download_button('📥 Descargar plan de producción',buff.getvalue(),file_name='plan_produccion_cc_v11.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                        else:
+                            st.warning('Con los costos, demanda y presupuesto disponibles, no se recomienda ninguna elaboración rentable y financiable.')
+                        if not issues.empty:st.dataframe(issues,hide_index=True,use_container_width=True)
+        except Exception as exc:
+            st.error('No se pudo preparar el plan: '+str(exc))
+    st.warning('Plan preliminar: no se consideran capacidad, plazos, materias primas ni gastos no cargados. El historial SQLite local no es persistente en Streamlit Cloud.')
