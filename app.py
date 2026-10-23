@@ -577,9 +577,9 @@ with main_formulas:
 
     formulas_db()
     if formula_store.is_remote:
-        st.success('Fórmulas conectadas a PostgreSQL de Supabase: guardado permanente activo.')
+        st.success('Fórmulas conectadas a Supabase (esquema produccion_cc): guardado permanente activo.')
     else:
-        st.warning('Fórmulas en SQLite local (provisional). Configurá DATABASE_URL en Streamlit Secrets para guardarlas permanentemente en Supabase.')
+        st.warning('Fórmulas en SQLite local (provisional). Configurá SUPABASE_URL y SUPABASE_KEY en Streamlit Secrets para guardarlas permanentemente en Supabase.')
     f1,fzip,f2,f3=st.tabs(['📥 Importar fórmula','📦 Importar ZIP','📚 Fórmulas e historial','✏️ Editar y simular'])
     with f1:
         formula_file=st.file_uploader('Subir fórmula de elaboración (.xlsx)',type=['xlsx','xls'],key='formula_upload',help='Subí un Excel de fórmula como el modelo de Mermelada Stevia Arándano. Se leerán ingredientes, código y rendimiento Bejerman.')
@@ -830,7 +830,7 @@ with main_stock:
                 all_details.to_excel(writer,sheet_name='Stock historico',index=False)
             st.download_button('📥 Descargar historial de stock (Excel)',export.getvalue(),file_name='historial_stock_cc.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',help='Guardá este respaldo fuera de Streamlit: el historial local no es permanente.')
             st.caption('Cada carga es una fotografía completa. Las versiones anteriores se conservan; no se reemplazan.')
-    st.warning('⚠️ El historial de stock y fórmulas se guarda por ahora en SQLite local. Streamlit Cloud puede borrar esa información al reiniciar o redesplegar. Descargá respaldos y conectemos almacenamiento permanente antes de usarlo operativamente.')
+    st.warning('⚠️ El historial de stock se guarda por ahora en SQLite local; las fórmulas usan Supabase si está configurado. Streamlit Cloud puede borrar esa información al reiniciar o redesplegar. Descargá respaldos y conectemos almacenamiento permanente antes de usarlo operativamente.')
 
 
 
