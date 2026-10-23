@@ -549,56 +549,89 @@ with main_formulas:
         return formula_store.save(code,product,bejerman,theoretical,notes,ingredients,origin)
 
     def parse_formula_excel(upload, source_name=None):
+        """Detecta encabezados y columnas por nombre, no por posición fija."""
         book = pd.ExcelFile(upload)
-        raw = pd.read_excel(book, sheet_name=0, header=None, dtype=object)
-        def cell(r, c):
-            return raw.iat[r, c] if 0 <= r < len(raw) and 0 <= c < len(raw.columns) else None
-        def numeric(value):
-            return parse_amount(value)
-        code = None; name = None; revision = None; bej = np.nan; theo = np.nan
-        items = []; in_table = False; group = ''
-        for i in range(len(raw)):
-            vals = [clean(v) if pd.notna(v) else '' for v in raw.iloc[i].tolist()]
-            if 'VERSION' in vals and ('CODIGO' in vals or 'COD' in vals):
-                revision = cell(i + 1, vals.index('VERSION'))
-                code_col = vals.index('CODIGO') if 'CODIGO' in vals else vals.index('COD')
-                candidate = cell(i + 1, code_col)
-                if pd.notna(candidate) and str(candidate).strip():
-                    code = str(candidate).strip()
-            if name is None:
-                for value in raw.iloc[i, :min(3, len(raw.columns))]:
-                    if pd.notna(value) and any(t in clean(value) for t in ('MERMELADA', 'JUGO', 'DULCE', 'BEBIDA', 'GELATINA', 'INFUSION')) and not any(t in clean(value) for t in ('RENDIMIENTO', 'OBSERVACION')):
-                        name = str(value).strip(); break
-            label = vals[0] if vals else ''
-            if 'RENDIMIENTO' in label or 'RENDIMEINTO' in label:
-                if 'BEJERMAN' in label: bej = numeric(cell(i, 2))
-                elif 'TEORICO' in label: theo = numeric(cell(i, 2))
-            if len(vals) > 2 and vals[1] == 'INGREDIENTE' and vals[2] == 'CANTIDAD':
-                in_table = True; continue
-            if in_table:
-                if any(t in label for t in ('MASA TOTAL', 'DATOS FISICOQUIMICOS', 'BRIX FINALES')):
-                    in_table = False; continue
-                ingredient = cell(i, 1); qty = numeric(cell(i, 2))
-                if pd.notna(cell(i, 0)) and str(cell(i, 0)).strip(): group = str(cell(i, 0)).strip()
-                if pd.notna(ingredient) and str(ingredient).strip() and pd.notna(qty):
-                    brix = numeric(cell(i, 4))
-                    unit = cell(i, 3)
-                    items.append({'grupo': group, 'ingrediente': str(ingredient).strip(),
-                                  'cantidad': float(qty), 'unidad': str(unit).strip() if pd.notna(unit) else '',
-                                  'brix': None if pd.isna(brix) else float(brix)})
-        if not items:
-            raise ValueError('No encontré una tabla de ingredientes con cantidades. Revisar formato.')
-        if pd.isna(bej) or bej <= 0:
-            raise ValueError('No encontré un rendimiento Bejerman positivo. Se requiere para simular elaboraciones completas; no se inventará.')
-        origin = str(source_name or getattr(upload, 'name', '') or name or 'formula')
-        if not name:
-            name = Path(origin).stem
-        # La identidad interna nunca depende exclusivamente del código Bejerman:
-        # evita fusionar fórmulas diferentes con códigos repetidos.
-        identifier = 'F-' + hashlib.sha256(origin.encode('utf-8')).hexdigest()[:16].upper()
-        return {'codigo': identifier, 'codigo_bejerman': code or '', 'producto': str(name).strip(),
-                'revision_original': revision, 'bejerman': float(bej),
-                'teorico': float(theo) if pd.notna(theo) else 0., 'ingredientes': pd.DataFrame(items)}
+        origin = str(source_name or getattr(upload, 'name', '') or 'formula.xlsx')
+        problems = []
+        for sheet in book.sheet_names[:5]:
+            raw = pd.read_excel(book, sheet_name=sheet, header=None, dtype=object)
+            def val(r, c):
+                return raw.iat[r, c] if 0 <= r < len(raw) and 0 <= c < len(raw.columns) else None
+            def norm(v):
+                return clean(v) if pd.notna(v) else ''
+            def num(v):
+                return parse_amount(v)
+            name = None; code = None; revision = None
+            bej = np.nan; theo = np.nan; items = []
+            # Nombre: preferir título de producto; en su ausencia usar el nombre del archivo.
+            for i in range(min(15, len(raw))):
+                for j in range(min(5, len(raw.columns))):
+                    v = val(i,j); t = norm(v)
+                    if not t or len(t) > 110: continue
+                    if any(k in t for k in ('MERMELADA','GELATINA','BEBIDA','JUGO','DULCE','INFUSION','POLVO','SUPLEMENTO','JALEA')) and not any(k in t for k in ('RENDIMIENTO','INGREDIENTE','FORMULA ORIGINAL','PROCEDIMIENTO','REVISION')):
+                        name = str(v).strip(); break
+                if name: break
+            if not name: name = Path(origin).stem
+            for i in range(min(15,len(raw))):
+                labels = [norm(v) for v in raw.iloc[i].tolist()]
+                for j,t in enumerate(labels):
+                    if t in ('CODIGO','COD'):
+                        c = val(i+1,j)
+                        if pd.notna(c) and str(c).strip(): code = str(c).strip()
+                    if t in ('VERSION','VERSION:','REVISION'):
+                        c = val(i+1,j)
+                        if pd.notna(c): revision = str(c).strip()
+            for i in range(len(raw)):
+                labels = [norm(v) for v in raw.iloc[i].tolist()]
+                for j,t in enumerate(labels[:min(6,len(labels))]):
+                    if 'RENDIMIENTO' not in t and 'RENDIMEINTO' not in t and 'RENDIMINETO' not in t: continue
+                    if 'BEJERMAN' not in t and 'TEORICO' not in t: continue
+                    candidates = [num(val(i,k)) for k in range(j+1,min(len(labels),j+9))]
+                    candidates = [v for v in candidates if pd.notna(v) and v > 0]
+                    if candidates:
+                        if 'BEJERMAN' in t: bej = candidates[0]
+                        elif 'TEORICO' in t: theo = candidates[0]
+            for i in range(min(len(raw),90)):
+                labels = [norm(v) for v in raw.iloc[i].tolist()]
+                ingredient_col = next((j for j,t in enumerate(labels) if t in ('INGREDIENTE','INGREDIENTES','MATERIA PRIMA','MATERIAS PRIMAS')),None)
+                qty_col = next((j for j,t in enumerate(labels) if t in ('CANTIDAD','CANTIDADES','CANT.','CANT','KG','PESO (KG)')),None)
+                if ingredient_col is None or qty_col is None or ingredient_col == qty_col: continue
+                unit_col = next((j for j,t in enumerate(labels) if t in ('UNID','UND','UNIDAD','UNIDADES','U.M.')),None)
+                brix_col = next((j for j,t in enumerate(labels) if 'BRIX' in t and 'KG' not in t),None)
+                group = ''; current = []; blanks = 0
+                for r in range(i+1,min(len(raw),i+250)):
+                    ing = val(r,ingredient_col); text = norm(ing)
+                    qty = num(val(r,qty_col))
+                    rowfirst = norm(val(r,0))
+                    if any(x in rowfirst for x in ('MASA TOTAL','TOTAL MASA','DATOS FISICOQUIMICOS','RENDIMIENTO','RENDIMEINTO','OBSERVACIONES','REVISIONES')) or text in ('TOTAL','MASA TOTAL','SUBTOTAL'):
+                        if current: break
+                    if not text or text in ('INGREDIENTE','INGREDIENTES') or text.startswith('TOTAL '):
+                        blanks += 1
+                        if blanks > 7 and current: break
+                        continue
+                    blanks = 0
+                    if pd.isna(qty) or qty < 0: continue
+                    if ingredient_col != 0:
+                        g = val(r,0)
+                        if pd.notna(g) and str(g).strip(): group = str(g).strip()
+                    unit = val(r,unit_col) if unit_col is not None else ''
+                    brix = num(val(r,brix_col)) if brix_col is not None else np.nan
+                    current.append({'grupo':group,'ingrediente':str(ing).strip(),
+                                    'cantidad':float(qty),'unidad':str(unit).strip() if pd.notna(unit) else '',
+                                    'brix':None if pd.isna(brix) else float(brix)})
+                if len(current) > len(items): items = current
+            if not items:
+                problems.append(f'{sheet}: no se identificó una tabla de ingredientes con cantidades')
+                continue
+            # Si falta rendimiento, conservar ingredientes y marcar pendiente.
+            if pd.isna(bej) or bej <= 0:
+                bej = np.nan
+            identifier = 'F-' + hashlib.sha256(origin.encode('utf-8')).hexdigest()[:16].upper()
+            return {'codigo':identifier,'codigo_bejerman':code or '', 'producto':name,
+                    'revision_original':revision,'bejerman':None if pd.isna(bej) else float(bej),
+                    'teorico':float(theo) if pd.notna(theo) else 0.,
+                    'ingredientes':pd.DataFrame(items)}
+        raise ValueError('; '.join(problems[:3]) or 'No se encontró una hoja de fórmula interpretable')
 
     formulas_db()
     if formula_store.is_remote:
@@ -613,7 +646,7 @@ with main_formulas:
                 parsed=parse_formula_excel(formula_file, formula_file.name)
                 st.write(f"**{parsed['producto']}** · Código Bejerman: {parsed['codigo_bejerman'] or 'Sin código'} · Revisión del Excel: {parsed['revision_original']}")
                 x,y=st.columns(2)
-                x.metric('Rendimiento Bejerman (packs)',f"{parsed['bejerman']:,.2f}")
+                x.metric('Rendimiento Bejerman',f"{parsed['bejerman']:,.2f}" if parsed['bejerman'] is not None else 'Pendiente')
                 y.metric('Rendimiento teórico (packs)',f"{parsed['teorico']:,.2f}")
                 st.dataframe(parsed['ingredientes'],hide_index=True,use_container_width=True)
                 import_note=st.text_input('Observaciones de importación',key='formula_import_note',help='Anotá el motivo de la carga o la revisión de la fórmula.')
@@ -652,7 +685,7 @@ with main_formulas:
                     st.warning(f'{len(issues)} archivo(s) no se pudieron interpretar. No se guardarán.')
                     st.dataframe(pd.DataFrame(issues),hide_index=True,use_container_width=True)
                 if parsed_files:
-                    preview_rows=[{'Archivo':filename,'Código Bejerman':data['codigo_bejerman'],'Producto':data['producto'],'Rendimiento Bejerman':data['bejerman'],'Ingredientes':len(data['ingredientes'])} for filename,data in parsed_files]
+                    preview_rows=[{'Archivo':filename,'Código Bejerman':data['codigo_bejerman'],'Producto':data['producto'],'Rendimiento Bejerman':data['bejerman'],'Estado':'Pendiente de rendimiento' if data['bejerman'] is None else 'Completa','Ingredientes':len(data['ingredientes'])} for filename,data in parsed_files]
                     st.dataframe(pd.DataFrame(preview_rows),hide_index=True,use_container_width=True)
                     chosen=st.multiselect('Seleccioná las fórmulas a incorporar',options=[name for name,_ in parsed_files],default=[name for name,_ in parsed_files],key='zip_selected')
                     note=st.text_input('Observaciones de la importación',key='zip_notes')
@@ -676,7 +709,8 @@ with main_formulas:
         else:
             latest=versions.sort_values('version').drop_duplicates('codigo',keep='last')
             st.subheader('Fórmulas vigentes')
-            st.dataframe(latest[['codigo','producto','version','rendimiento_bejerman','rendimiento_teorico','creado']],hide_index=True,use_container_width=True)
+            latest['estado'] = latest['rendimiento_bejerman'].apply(lambda x: 'Pendiente de rendimiento' if pd.isna(x) or float(x)<=0 else 'Completa')
+            st.dataframe(latest[['codigo','producto','version','estado','rendimiento_bejerman','rendimiento_teorico','creado']],hide_index=True,use_container_width=True)
             st.subheader('Historial de revisiones')
             st.dataframe(versions[['codigo','producto','version','rendimiento_bejerman','observaciones','creado','origen']],hide_index=True,use_container_width=True)
             export=io.BytesIO()
@@ -696,7 +730,7 @@ with main_formulas:
             ingredients=formula_ingredients(selected_code,chosen_version)
             with st.form('formula_edit_form'):
                 new_product=st.text_input('Nombre del producto',value=base['producto'])
-                new_bej=st.number_input('Rendimiento Bejerman (packs por elaboración)',min_value=0.01,value=float(base['rendimiento_bejerman']),format='%.4f',help='Rendimiento con merma. Es el utilizado para calcular elaboraciones completas.')
+                new_bej=st.number_input('Rendimiento Bejerman (packs por elaboración)',min_value=0.0,value=float(base['rendimiento_bejerman']) if pd.notna(base['rendimiento_bejerman']) else 0.0,format='%.4f',help='Rendimiento con merma. Es el utilizado para calcular elaboraciones completas.')
                 new_theo=st.number_input('Rendimiento teórico (referencia)',min_value=0.0,value=float(base['rendimiento_teorico'] or 0),format='%.4f')
                 edited=st.data_editor(ingredients,num_rows='dynamic',hide_index=True,use_container_width=True,key=f'edit_{selected_code}_{chosen_version}',column_config={'cantidad':st.column_config.NumberColumn('Cantidad',min_value=0),'ingrediente':st.column_config.TextColumn('Ingrediente',required=True)})
                 edit_note=st.text_input('Motivo del cambio / observaciones',help='El historial conserva esta nota junto con la fecha de la nueva versión.')
@@ -711,8 +745,8 @@ with main_formulas:
             st.subheader('Simular necesidad de elaboraciones completas')
             demand=st.number_input('Bultos necesarios (después de descontar stock)',min_value=0,max_value=1000000,value=150,step=1,key='formula_demand')
             # Se descartan fracciones: no se pueden despachar packs incompletos.
-            usable=int(np.floor(float(base['rendimiento_bejerman'])))
-            if usable<1:st.warning('El rendimiento Bejerman es menor a un bulto completo. Revisá la unidad de medida.')
+            usable=int(np.floor(float(base['rendimiento_bejerman']))) if pd.notna(base['rendimiento_bejerman']) else 0
+            if usable<1:st.warning('Pendiente de rendimiento Bejerman válido: esta fórmula no puede usarse para calcular elaboraciones.')
             else:
                 batches=int(np.ceil(demand/usable))
                 produced=batches*usable
