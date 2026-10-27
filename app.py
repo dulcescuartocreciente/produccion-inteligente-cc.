@@ -120,9 +120,10 @@ def read_historical(file):
         raw = pd.read_excel(book, sheet_name=sheet, header=None, dtype=object)
         for i in range(min(30, len(raw))):
             labels = [clean(v) if pd.notna(v) else '' for v in raw.iloc[i].tolist()]
-            if not all(x in labels for x in ('FECHA', 'CLIENTE', 'IMPORTE')):
+            if not ('CLIENTE' in labels and 'IMPORTE' in labels and ('FECHA ENTREGA' in labels or 'FECHA' in labels)):
                 continue
-            c, a, f = (labels.index(x) for x in ('CLIENTE', 'IMPORTE', 'FECHA'))
+            c, a = labels.index('CLIENTE'), labels.index('IMPORTE')
+            f = labels.index('FECHA ENTREGA') if 'FECHA ENTREGA' in labels else labels.index('FECHA')
             dated_cols = []
             for j, value in enumerate(raw.iloc[i].tolist()):
                 if j in (c, a, f) or pd.isna(value):
