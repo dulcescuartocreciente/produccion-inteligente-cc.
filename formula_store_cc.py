@@ -121,7 +121,7 @@ class FormulaStore:
     def save(self,code,product,bejerman,theoretical,notes,ingredients,origin):
         code=str(code).strip().upper();product=str(product).strip()
         if not code or not product:raise ValueError('Completá código y producto.')
-        if not np.isfinite(float(bejerman)) or float(bejerman)<=0:raise ValueError('El rendimiento Bejerman debe ser positivo.')
+        if bejerman is not None and (not np.isfinite(float(bejerman)) or float(bejerman)<=0):raise ValueError('El rendimiento Bejerman debe ser positivo cuando está informado.')
         rows=[]
         for _,r in ingredients.iterrows():
             name=str(r.get('ingrediente','')).strip()
@@ -135,7 +135,7 @@ class FormulaStore:
         if self.is_remote:
             payload = {
                 'p_codigo': code, 'p_producto': product,
-                'p_bejerman': float(bejerman), 'p_teorico': theoretical,
+                'p_bejerman': None if bejerman is None else float(bejerman), 'p_teorico': theoretical,
                 'p_notas': str(notes or ''), 'p_origen': str(origin or ''),
                 'p_ingredientes': [
                     {'grupo': r[0], 'ingrediente': r[1], 'cantidad': r[2], 'unidad': r[3], 'brix': r[4]}

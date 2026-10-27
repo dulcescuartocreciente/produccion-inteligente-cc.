@@ -1,0 +1,16 @@
+PRODUCCIÓN INTELIGENTE CC — MVP integrado (27/10/2026)
+
+CONTENIDO: app.py, formula_store_cc.py, optimizer_cc.py, requirements.txt, logo_cc.png.
+
+CAMBIOS EN ESTA ENTREGA:
+- Se recuperó optimizer_cc.py, ausente en el paquete anterior pese a ser importado por app.py.
+- Se conservan las mejoras de cobranzas, hojas de ruta y revisión manual de obligaciones del último paquete.
+- El presupuesto del plan ahora descuenta las obligaciones seleccionadas en la sección financiera (además de la reserva de seguridad). No las vuelvas a cargar en el campo de egresos comprometidos.
+- Se agregó asociación manual entre código de Distribución y fórmula vigente, ya que los códigos internos de fórmulas pueden no coincidir con Bejerman.
+- Se excluyen rendimientos faltantes o menores a un bulto comercial.
+
+PRUEBAS REALIZADAS: compilación de los tres archivos Python y prueba unitaria básica del optimizador MILP. NO se ha realizado una prueba de punta a punta en Streamlit Cloud ni una conciliación completa de los Excel reales.
+
+PARA PROBAR SIN AFECTAR PRODUCCIÓN: crear rama de prueba en GitHub o un despliegue separado, subir los cinco archivos y copiar los secrets SUPABASE_URL / SUPABASE_KEY de la aplicación de producción sin publicarlos. Verificar que las tablas de Supabase siguen conectadas. No tocar Distribución Inteligente CC.
+
+LIMITACIONES MVP: los historiales de stock/rutas/distribución siguen en SQLite local y pueden perderse al reiniciar Streamlit Cloud; la proyección financiera no representa cobros confirmados; el motor no asigna todavía fechas de fabricación ni modela insumos, capacidad y plazos; el cruce por remito no está cerrado; los importes de obligaciones se seleccionan manualmente y no se asignan a vencimientos. No publicar como sistema operativo definitivo sin estas validaciones.
