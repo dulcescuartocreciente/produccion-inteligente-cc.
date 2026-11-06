@@ -1246,10 +1246,203 @@ def cc_liquidity_scenario(mapped, profiles, start_date):
         st.success(f"{fast['Código']} combina en esta comparación el cobro más temprano con la mayor ganancia potencial.")
     st.warning('**Prueba de criterio, no optimización financiera definitiva.** Los importes suponen vender toda la necesidad neta al precio del Excel; no se agregan al Cash Flow ni se consideran cobros confirmados. El botón Optimizar producción sigue maximizando ganancia, sin reinvertir estas cobranzas.')
 
+
+def cc_weekly_plan(mapped, pending, profiles, start_date, weeks, opening_cash,
+                   existing_forecast, risk_pct, reserve):
+    """Plan semanal tentativo: caja cronológica, elaboraciones completas y cobro estimado."""
+    from math import ceil, floor
+    start = pd.Timestamp(start_date).normalize()
+    # Cada producto conserva la demanda neta; la distribución por cliente es proporcional
+    # porque el stock disponible no está asignado a pedidos/clientes.
+    pending = pending.copy()
+    if 'CLIENTE' not in pending.columns:
+        pending['CLIENTE'] = 'SIN CLIENTE'
+    pending['PENDIENTE'] = pd.to_numeric(pending['PENDIENTE'], errors='coerce').fillna(0)
+    pending['CODIGO'] = pending['CODIGO'].astype(str).str.strip().str.upper()
+    pending['CLIENTE'] = pending['CLIENTE'].fillna('SIN CLIENTE').astype(str)
+    rows = []
+    for item in mapped:
+        code = str(item['codigo'])
+        gross = pending.loc[pending['CODIGO'].eq(code), ['CLIENTE','PENDIENTE']]
+        total = float(gross['PENDIENTE'].sum())
+        qty = int(floor(float(item['demanda_neta'])))
+        if total <= 0 or qty <= 0:
+            continue
+        counts = gross.groupby('CLIENTE')['PENDIENTE'].sum().sort_values(ascending=False)
+        allocated = {}
+        fractions = []
+        for client, amount in counts.items():
+            exact = qty * float(amount) / total
+            allocated[client] = int(floor(exact))
+            fractions.append((exact-floor(exact),client))
+        for _, client in sorted(fractions, reverse=True)[:qty-sum(allocated.values())]:
+            allocated[client] += 1
+        client_mix = []
+        for client, amount in allocated.items():
+            if amount <= 0:
+                continue
+            profile = profiles.get(normalize_client(client), {})
+            client_mix.append((client, amount, profile.get('dias')))
+        rows.append(dict(item, remaining=qty, clients=client_mix))
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    # Cobros ya registrados: no se suman como ventas nuevas.
+    forecast = existing_forecast.copy() if existing_forecast is not None else pd.DataFrame()
+    scheduled = {}
+    if not forecast.empty and {'FECHA COBRANZA','IMPORTE'}.issubset(forecast.columns):
+        for _, r in forecast.iterrows():
+            dt = pd.to_datetime(r['FECHA COBRANZA'], errors='coerce')
+            amount = pd.to_numeric(r['IMPORTE'], errors='coerce')
+            if pd.notna(dt) and pd.notna(amount) and amount > 0:
+                day = dt.normalize()
+                scheduled[day] = scheduled.get(day,0.0)+float(amount)*(1-risk_pct/100)
+    cash = max(0.,float(opening_cash)-float(reserve))
+    result, weeks_out, unknown = [], [], []
+    # Los cobros estimados de nuevos pedidos se guardan aparte de los cobros históricos.
+    hypothetical = {}
+    for week in range(int(weeks)):
+        wstart = start+pd.Timedelta(days=7*week)
+        wend = wstart+pd.Timedelta(days=6)
+        arrivals = sum(v for d,v in scheduled.items() if wstart <= d <= wend)
+        recovered = sum(v for d,v in hypothetical.items() if wstart <= d <= wend)
+        cash += arrivals+recovered
+        opening = cash
+        invested = 0.
+        produced = 0
+        # Prioridad financiera: retorno esperado dentro de 30 días y margen por peso invertido.
+        candidates = []
+        for r in rows:
+            yield_b = int(floor(float(r['rendimiento'])))
+            cost = float(r['costo_bulto'])
+            price = float(r['precio_bulto'])
+            if yield_b <= 0 or cost <= 0 or price <= cost or r['remaining'] <= 0:
+                continue
+            known = [(n,d) for _,n,d in r['clients'] if d is not None]
+            known_qty = sum(n for n,d in known)
+            short_share = sum(n for n,d in known if d <= 14)/max(1,r['remaining'])
+            coverage = min(1,known_qty/max(1,r['remaining']))
+            margin = (price-cost)/cost
+            score = (1+2*short_share)*margin*(0.5+0.5*coverage)
+            candidates.append((score,r['codigo'],r))
+        candidates.sort(key=lambda t:(-t[0],t[1]))
+        # Distribución de caja semanal entre productos: una elaboración por vuelta,
+        # evitando que el primer producto consuma toda la caja antes de evaluar otros.
+        while True:
+            progressed = False
+            for _,_,r in candidates:
+                y = int(floor(float(r['rendimiento'])))
+                batch_cost = y*float(r['costo_bulto'])
+                if r['remaining'] <= 0 or cash+1e-8 < batch_cost:
+                    continue
+                sale_qty = min(y,int(r['remaining']))
+                # Una elaboración completa puede producir excedente, cuyo costo se paga.
+                cash -= batch_cost
+                invested += batch_cost
+                produced += y
+                r['remaining'] -= sale_qty
+                # Atribuir los bultos vendibles proporcionalmente a los clientes pendientes.
+                client_total = sum(n for _,n,d in r['clients'])
+                client_receipts = []
+                if client_total > 0:
+                    alloc = []
+                    assigned = 0
+                    for i,(client,n,days) in enumerate(r['clients']):
+                        take = min(n, int(floor(sale_qty*n/client_total)))
+                        alloc.append(take);assigned+=take
+                    for i in sorted(range(len(r['clients'])),key=lambda i:-r['clients'][i][1]):
+                        if assigned>=sale_qty:break
+                        if alloc[i]<r['clients'][i][1]:
+                            alloc[i]+=1;assigned+=1
+                    next_clients=[]
+                    for (client,n,days),take in zip(r['clients'],alloc):
+                        if take>0:
+                            if days is None:
+                                unknown.append({'Semana':week+1,'Código':r['codigo'],'Cliente':client,
+                                                'Bultos':take,'Motivo':'Sin plazo histórico inequívoco'})
+                            else:
+                                # Entrega supuesta al finalizar la semana de fabricación.
+                                collection_day=wend+pd.Timedelta(days=int(days))
+                                amount=take*float(r['precio_bulto'])*(1-risk_pct/100)
+                                hypothetical[collection_day]=hypothetical.get(collection_day,0.)+amount
+                                client_receipts.append(collection_day)
+                        if n-take>0:next_clients.append((client,n-take,days))
+                    r['clients']=next_clients
+                result.append({'Semana':week+1,'Desde':wstart.date(),'Hasta':wend.date(),
+                               'Código':r['codigo'],'Producto':r['descripcion'],
+                               'Elaboraciones':1,'Bultos producidos':y,'Bultos para pedidos':sale_qty,
+                               'Excedente':y-sale_qty,'Inversión':batch_cost,
+                               'Venta potencial':sale_qty*float(r['precio_bulto']),
+                               'Ganancia potencial':sale_qty*float(r['precio_bulto'])-batch_cost,
+                               'Cobro estimado más temprano':min(client_receipts).date() if client_receipts else pd.NaT})
+                progressed=True
+            if not progressed:
+                break
+        weeks_out.append({'Semana':week+1,'Desde':wstart.date(),'Hasta':wend.date(),
+                          'Caja al inicio de asignación':opening,
+                          'Cobros existentes previstos (ajustados)':arrivals,
+                          'Cobros nuevos hipotéticos (ajustados)':recovered,
+                          'Inversión programada':invested,'Saldo proyectado':cash,
+                          'Bultos producidos':produced})
+    return pd.DataFrame(result),pd.DataFrame(weeks_out),pd.DataFrame(unknown)
+
+
+def cc_render_weekly_plan(mapped, pending, start_date, history_file, initial_cash,
+                          risk, reserve, analysis):
+    st.subheader('📅 Planificación semanal tentativa automática')
+    st.caption('Se genera automáticamente con demanda, fórmulas, costos, caja y condiciones históricas de pago por cliente. No exige elegir dos productos.')
+    weeks = st.selectbox('Horizonte semanal', [2,4,6,8,12], index=1,
+                         format_func=lambda n:f'{n} semanas', key='cc_weekly_weeks')
+    try:
+        routes,_ = load_routes()
+        cf = read_historical(history_file) if history_file is not None else pd.DataFrame()
+        profiles = cc_payment_profiles(routes,cf)
+        forecast = analysis[0] if analysis is not None else pd.DataFrame()
+        # Preferir la caja inicial del escenario analizado cuando exista.
+        cash = float(analysis[2]) if analysis is not None else float(initial_cash)
+        risk_pct = int(analysis[3]) if analysis is not None else int(risk)
+        weekly_reserve = float(analysis[5]) if analysis is not None else float(reserve)
+        weekly_reserve += float(st.session_state.get('cc_obligation_reserve',0.))
+        weekly_reserve += float(st.session_state.get('v11_expenses',0.))
+        plan, summary, missing = cc_weekly_plan(
+            mapped,pending,profiles,start_date,weeks,cash,forecast,risk_pct,weekly_reserve)
+        if not profiles:
+            st.warning('Sin historial de condiciones de pago utilizable: el plan puede fabricar, pero no proyecta cobros nuevos sin plazo conocido.')
+        if plan.empty:
+            st.warning('No se encontraron elaboraciones completas financiables con la caja disponible. No se anticipan cobranzas futuras para financiar producción hoy.')
+        else:
+            grouped = plan.groupby(['Semana','Desde','Hasta','Código','Producto'],as_index=False).agg(
+                {'Elaboraciones':'sum','Bultos producidos':'sum','Bultos para pedidos':'sum',
+                 'Excedente':'sum','Inversión':'sum','Venta potencial':'sum','Ganancia potencial':'sum'})
+            st.dataframe(grouped,hide_index=True,use_container_width=True)
+            st.metric('Elaboraciones propuestas',int(plan['Elaboraciones'].sum()))
+            st.metric('Inversión tentativa total',money(plan['Inversión'].sum()))
+        if not summary.empty:
+            st.subheader('Caja proyectada por semana')
+            st.dataframe(summary,hide_index=True,use_container_width=True)
+        if not missing.empty:
+            st.warning(f'{len(missing)} asignaciones a clientes sin condición histórica inequívoca: sus cobros no se sumaron a la caja.')
+            with st.expander('Ver clientes sin condición estimable'):
+                st.dataframe(missing,hide_index=True,use_container_width=True)
+        st.caption('SUPUESTOS: entrega al final de la semana de fabricación; sin capacidad máxima, plazos de insumos ni fechas prometidas de entrega. '
+                   'Stock distribuido proporcionalmente entre clientes del mismo producto. '
+                   'Condición de pago modal histórica, estimada (no confirmada). '
+                   'Las cobranzas nuevas son hipotéticas y se muestran separadas del Cash Flow existente; '
+                   'no se garantiza su cobro. No emitir órdenes sin revisión.')
+        export=io.BytesIO()
+        with pd.ExcelWriter(export,engine='xlsxwriter') as writer:
+            (grouped if not plan.empty else pd.DataFrame()).to_excel(writer,sheet_name='Plan semanal',index=False)
+            summary.to_excel(writer,sheet_name='Caja semanal',index=False)
+            missing.to_excel(writer,sheet_name='Plazos a revisar',index=False)
+        st.download_button('📥 Descargar planificación semanal tentativa',export.getvalue(),
+                           file_name='produccion_cc_plan_semanal_tentativo.xlsx')
+    except Exception as exc:
+        st.error('No se pudo generar la planificación semanal: '+str(exc))
+
+
 # ─── V11 · PLAN DE PRODUCCIÓN ORIENTADO A RENTABILIDAD ───
 with main_plan:
     from optimizer_cc import optimize_batches
-    st.header('🏭 Plan de producción · máxima ganancia')
+    st.header('🏭 Plan de producción · planificación semanal y rentabilidad')
     st.caption('Optimiza elaboraciones completas con demanda pendiente real, rendimiento Bejerman, costo por bulto y presupuesto. No supone que los excedentes se venden.')
     st.info('Para empezar: cargá una distribución en «Demanda y distribución», costos en la barra lateral y las fórmulas en «Fórmulas y rendimientos».')
 
@@ -1375,15 +1568,9 @@ with main_plan:
                     mapped.append({'codigo':code,'descripcion':str(item.DESCRIPCION),'demanda_neta':float(item['NECESIDAD NETA']),
                         'rendimiento':float(formula['rendimiento_bejerman'])/units_per_bulto,
                         'costo_bulto':float(cost_row['COSTO POR BULTO']),'precio_bulto':float(cost_row['PRECIO POR BULTO'])})
-                try:
-                    historical_cf = read_historical(history_file) if history_file is not None else pd.DataFrame()
-                    historical_routes, _ = load_routes()
-                    client_profiles = cc_payment_profiles(historical_routes, historical_cf)
-                    if not client_profiles:
-                        st.info('No hay condiciones históricas utilizables. Guardá una hoja de ruta o subí el Cash Flow y usá plazos confirmados en esta prueba.')
-                    cc_liquidity_scenario(mapped, client_profiles, reference_date)
-                except Exception as exc:
-                    st.warning('No pude preparar la prueba de condiciones de pago: ' + str(exc))
+                if mapped and not duplicate_prices and not duplicate_formulas:
+                    cc_render_weekly_plan(mapped,source_pending,reference_date,history_file,
+                                          initial_cash,risk,safety,st.session_state.get('analysis'))
                 st.subheader('3. Presupuesto para fabricar')
                 financial_budget=0.
                 if 'analysis' in st.session_state:
