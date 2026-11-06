@@ -1089,6 +1089,57 @@ with main_demand:
     st.warning('Los registros guardados localmente pueden perderse al reiniciar Streamlit Cloud. Para un historial definitivo falta conectar una base de datos persistente.')
 
 
+# Coincidencias conservadoras: no vincular automáticamente presentaciones ambiguas.
+def cc_match_tokens(value):
+    text = clean(value)
+    text = re.sub(r'(?<=\d)\s*[X×]\s*(?=\d)', 'X', text)
+    text = re.sub(r'[^A-Z0-9]+', ' ', text)
+    replacements = {'MERM':'MERMELADA','AZUC':'AZUCAR','FRUT':'FRUTILLA',
+                    'ARANDANOS':'ARANDANO','ROJ':'ROJOS','C':'CON'}
+    tokens = [replacements.get(t,t) for t in text.split()]
+    ignored = {'DE','DEL','LA','EL','CON','POR','PACK','PACKS','BULTO','BULTOS'}
+    return set(t for t in tokens if t not in ignored)
+
+
+def cc_auto_matches(code, description, formula_rows, price_rows):
+    """Devuelve sugerencias únicamente si la coincidencia es inequívoca."""
+    from difflib import SequenceMatcher
+    target = cc_match_tokens(description)
+    normalized_code = clean(code).replace(' ','')
+    def pick(rows, name_key, code_key=None):
+        exact_code = []
+        if code_key:
+            exact_code = [r for r in rows if clean(r.get(code_key,'')).replace(' ','') == normalized_code]
+            if len(exact_code) == 1:
+                return exact_code[0]['id'], 'Código exacto'
+            if len(exact_code) > 1:
+                return None, 'Código duplicado: revisar'
+        candidates=[]
+        for r in rows:
+            tokens=cc_match_tokens(r[name_key])
+            if not target or not tokens:
+                continue
+            # Los números de presentación deben coincidir cuando están presentes.
+            nums_target={x for x in target if any(c.isdigit() for c in x)}
+            nums_other={x for x in tokens if any(c.isdigit() for c in x)}
+            if nums_target and nums_other and nums_target != nums_other:
+                continue
+            similarity=SequenceMatcher(None,' '.join(sorted(target)),' '.join(sorted(tokens))).ratio()
+            if target == tokens or (len(target)>=3 and target.issubset(tokens) and all(any(c.isdigit() for c in extra) for extra in (tokens-target))):
+                similarity=1.0
+            candidates.append((similarity,r['id']))
+        candidates.sort(reverse=True)
+        if not candidates:
+            return None, 'Sin coincidencia'
+        # Se exige similitud alta y separación clara del segundo candidato.
+        best=candidates[0]
+        runner=candidates[1][0] if len(candidates)>1 else 0
+        if best[0]>=0.93 and best[0]-runner>=0.08:
+            return best[1], 'Nombre muy similar'
+        return None, 'Revisar coincidencia'
+    return pick(formula_rows,'nombre','bejerman'), pick(price_rows,'nombre')
+
+
 # ─── V11 · PLAN DE PRODUCCIÓN ORIENTADO A RENTABILIDAD ───
 with main_plan:
     from optimizer_cc import optimize_batches
@@ -1149,18 +1200,53 @@ with main_plan:
                 formula_options=['— Sin fórmula —']+latest_formula['codigo'].astype(str).tolist()
                 selected_formulas={}
                 valid_prices=prices[prices.ESTADO=='Válido'].copy()
-                # Explicit mapping: profitability file has names but no product codes.
                 st.subheader('1. Vincular productos con costos y fórmulas')
-                st.caption('Vinculá manualmente cada código de Distribución con su fórmula y su precio. No se presupone que los códigos internos de fórmulas coincidan con los de Bejerman.')
+                st.caption('Se proponen asociaciones automáticas solo cuando la coincidencia es clara. Podés corregirlas manualmente; las dudosas quedan sin vincular.')
                 options=['— Sin vincular —']+valid_prices.PRODUCTO.tolist()
                 units_per_bulto=st.number_input('Packs del rendimiento Bejerman por cada bulto comercial',min_value=1,value=1,step=1,key='v11_packs_per_bulto',help='Si Bejerman expresa packs y cada bulto comercial contiene varios packs, ingresá cuántos packs forman un bulto. Si son equivalentes, dejá 1.')
+                formula_rows=[]
+                for _, f in latest_formula.iterrows():
+                    origin=str(f.get('origen','') or '')
+                    bej_code_match=re.search(r'código Bejerman\s+([^;]+)',origin,re.IGNORECASE)
+                    bej_code=bej_code_match.group(1).strip() if bej_code_match else ''
+                    if clean(bej_code) in ('SIN CODIGO','SIN CÓDIGO'):bej_code=''
+                    formula_rows.append({'id':str(f['codigo']),'nombre':str(f['producto']),'bejerman':bej_code})
+                price_rows=[{'id':str(x),'nombre':str(x)} for x in valid_prices.PRODUCTO.tolist()]
+                suggestions={}
+                for _, row in needs.iterrows():
+                    code=str(row['CODIGO'])
+                    suggestions[code]=cc_auto_matches(code,str(row['DESCRIPCION']),formula_rows,price_rows)
+                # No se asigna automáticamente una fórmula o un costo a dos productos.
+                for position in (0,1):
+                    ids=[pair[position][0] for pair in suggestions.values() if pair[position][0] is not None]
+                    repeated={x for x in ids if ids.count(x)>1}
+                    if repeated:
+                        for code,pair in list(suggestions.items()):
+                            if pair[position][0] in repeated:
+                                pair=list(pair)
+                                pair[position]=(None,'Coincidencia compartida: revisar')
+                                suggestions[code]=tuple(pair)
+                automatic=sum(1 for f,p in suggestions.values() if f[0] is not None and p[0] is not None)
+                st.caption(f'Asociaciones completas sugeridas: {automatic} de {len(needs)} productos con faltante. Revisá las sugerencias antes de optimizar.')
                 mappings=[]
                 for _, row in needs.iterrows():
-                    code=str(row["CODIGO"])
+                    code=str(row['CODIGO'])
+                    (suggest_formula,why_formula),(suggest_price,why_price)=suggestions[code]
+                    fk=f'v11_formula_{code}'
+                    pk=f'v11_match_{code}'
+                    if fk in st.session_state and st.session_state[fk] not in formula_options:
+                        del st.session_state[fk]
+                    if pk in st.session_state and st.session_state[pk] not in options:
+                        del st.session_state[pk]
+                    if fk not in st.session_state:
+                        st.session_state[fk]=suggest_formula if suggest_formula in formula_options else '— Sin fórmula —'
+                    if pk not in st.session_state:
+                        st.session_state[pk]=suggest_price if suggest_price in options else '— Sin vincular —'
                     with st.expander(f'{code} · {row["DESCRIPCION"]} · faltan {row["NECESIDAD NETA"]:,.0f} bultos',expanded=False):
-                        formula_code=st.selectbox('Fórmula vigente',formula_options,index=formula_options.index(code) if code in formula_by_code else 0,format_func=lambda x: '— Sin fórmula —' if x=='— Sin fórmula —' else f'{formula_by_code[x]["producto"]} ({x})',key=f'v11_formula_{code}')
-                        if formula_code!='— Sin fórmula —':selected_formulas[code]=formula_code
-                        selected=st.selectbox('Producto en Excel de rentabilidad',options,key=f'v11_match_{code}')
+                        st.caption(f'Sugerencia de fórmula: {why_formula} · Rentabilidad: {why_price}')
+                        formula_code=st.selectbox('Fórmula vigente',formula_options,format_func=lambda x: '— Sin fórmula —' if x=='— Sin fórmula —' else f'{formula_by_code[x]["producto"]} ({x})',key=fk)
+                        selected=st.selectbox('Producto en Excel de rentabilidad',options,key=pk)
+                    if formula_code!='— Sin fórmula —':selected_formulas[code]=formula_code
                     if selected!='— Sin vincular —' and code in selected_formulas:
                         mappings.append((code,selected))
                 duplicate_prices=pd.Series([x[1] for x in mappings]).duplicated().any() if mappings else False
