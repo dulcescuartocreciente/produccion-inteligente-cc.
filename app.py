@@ -1140,6 +1140,112 @@ def cc_auto_matches(code, description, formula_rows, price_rows):
     return pick(formula_rows,'nombre','bejerman'), pick(price_rows,'nombre')
 
 
+
+# ─── Prueba controlada de liquidez por cliente ───
+def cc_payment_profiles(routes, cashflow):
+    """Moda de días por operación; no transforma cobranzas en pedidos pendientes."""
+    observations = []
+    if not routes.empty:
+        for _, r in routes.iterrows():
+            days = pd.to_numeric(r.get('DÍAS DE PAGO'), errors='coerce')
+            if pd.notna(days) and 0 <= days <= 365:
+                observations.append((normalize_client(r['CLIENTE']), int(days),
+                                     pd.to_datetime(r.get('FECHA'), errors='coerce'), 'RUTA'))
+    if not cashflow.empty:
+        cf = cashflow.copy()
+        cf['FECHA ENTREGA'] = pd.to_datetime(cf['FECHA ENTREGA'], errors='coerce')
+        cf['FECHA COBRANZA'] = pd.to_datetime(cf['FECHA COBRANZA'], errors='coerce')
+        # Una venta con varias cuotas no equivale a varias condiciones de pago.
+        for _, r in cf.iterrows():
+            days = (r['FECHA COBRANZA'] - r['FECHA ENTREGA']).days
+            if pd.notna(r['FECHA ENTREGA']) and pd.notna(r['FECHA COBRANZA']) and 0 <= days <= 365:
+                observations.append((normalize_client(r['CLIENTE']), int(days), r['FECHA ENTREGA'], 'CASH FLOW'))
+    # Si coinciden ruta y cash flow para el mismo cliente, fecha y plazo,
+    # se cuenta una sola observación, evitando sobrerrepresentar la operación.
+    unique = {}
+    for client, days, dt, origin in observations:
+        key = (client, str(dt.date()) if pd.notna(dt) else '', days)
+        if client and key not in unique:
+            unique[key] = (client, days)
+    from collections import Counter, defaultdict
+    by_client = defaultdict(list)
+    for client, days in unique.values():
+        by_client[client].append(days)
+    result = {}
+    for client, days_list in by_client.items():
+        counts = Counter(days_list)
+        most = counts.most_common()
+        winners = [d for d, n in most if n == most[0][1]]
+        result[client] = {'dias': winners[0] if len(winners) == 1 else None,
+                          'frecuencia': most[0][1], 'total': len(days_list),
+                          'empate': len(winners) > 1}
+    return result
+
+
+def cc_liquidity_scenario(mapped, profiles, start_date):
+    """Simulador orientativo; no modifica el optimizador de ganancia."""
+    st.subheader('2. 🕒 Prueba de recuperación de capital por condición de pago')
+    st.caption('Prueba dos productos y clientes concretos. La hoja de ruta y el Cash Flow no identifican qué producto compró cada cliente: esa asociación se confirma aquí para la simulación.')
+    if len(mapped) < 2:
+        st.info('Vinculá al menos dos productos con costo y fórmula válidos para comparar sus cobranzas.')
+        return
+    codes = [r['codigo'] for r in mapped]
+    labels = {r['codigo']: f"{r['codigo']} · {r['descripcion']}" for r in mapped}
+    clients = ['— Seleccionar cliente —', 'Cliente sin historial (prueba)'] + sorted(profiles)
+    cols = st.columns(2)
+    chosen = []
+    for i, col in enumerate(cols):
+        with col:
+            code = st.selectbox(f'Producto {i+1}', codes, index=min(i, len(codes)-1),
+                                format_func=lambda x: labels[x], key=f'cc_liq_product_{i}')
+            client = st.selectbox(f'Cliente del pedido {i+1}', clients, key=f'cc_liq_client_{i}')
+            profile = profiles.get(client)
+            if profile and profile['dias'] is not None:
+                st.caption(f"Historial: {profile['dias']} días ({profile['frecuencia']} de {profile['total']} registros). **Estimado**, no confirmado.")
+            elif profile:
+                st.warning('El historial presenta un empate entre condiciones: confirmá el plazo.')
+            else:
+                st.caption('Sin condición histórica seleccionada.')
+            override = st.checkbox('Confirmar otro plazo para este pedido', key=f'cc_liq_override_{i}')
+            days = st.number_input('Días hasta cobrar desde la entrega', min_value=0, max_value=365,
+                                   value=0 if not profile or profile['dias'] is None else int(profile['dias']),
+                                   step=1, disabled=not override, key=f'cc_liq_days_{i}')
+            delivery = st.date_input('Fecha prevista de entrega', value=pd.Timestamp(start_date).date(),
+                                     format='DD/MM/YYYY', key=f'cc_liq_delivery_{i}')
+            effective = int(days) if override else (profile['dias'] if profile else None)
+            item = next(x for x in mapped if x['codigo'] == code)
+            chosen.append({'producto': code, 'cliente': client, 'dias': effective,
+                           'entrega': delivery, 'costo': item['costo_bulto'],
+                           'precio': item['precio_bulto'], 'demanda': item['demanda_neta'],
+                           'fuente': 'Confirmado para prueba' if override else 'Estimación histórica'})
+    if chosen[0]['producto'] == chosen[1]['producto']:
+        st.warning('Elegí dos productos distintos para comparar.')
+        return
+    if any(x['cliente'] == '— Seleccionar cliente —' or x['dias'] is None for x in chosen):
+        st.info('Elegí un cliente con historial válido para cada producto o confirmá manualmente los días de pago.')
+        return
+    rows = []
+    for x in chosen:
+        qty = max(0, int(x['demanda']))
+        investment = qty*x['costo']
+        income = qty*x['precio']
+        rows.append({'Código': x['producto'], 'Cliente': x['cliente'], 'Bultos de referencia': qty,
+                     'Inversión estimada': investment, 'Cobranza estimada': income,
+                     'Ganancia potencial': income-investment, 'Plazo de pago (días)': x['dias'],
+                     'Fecha estimada de cobro': pd.Timestamp(x['entrega']) + pd.Timedelta(days=x['dias']),
+                     'Condición': x['fuente']})
+    result = pd.DataFrame(rows)
+    st.dataframe(result, hide_index=True, use_container_width=True)
+    fast = sorted(rows, key=lambda r: (r['Fecha estimada de cobro'], -r['Ganancia potencial']))[0]
+    profitable = sorted(rows, key=lambda r: -r['Ganancia potencial'])[0]
+    if fast['Código'] != profitable['Código']:
+        st.info(f"**Para recuperar capital antes:** {fast['Código']} (cobro previsto {fast['Fecha estimada de cobro']:%d/%m/%Y}). "
+                f"**Por ganancia potencial:** {profitable['Código']}. La decisión final depende de la caja disponible, "
+                'las fechas de entrega y la capacidad de volver a fabricar.')
+    else:
+        st.success(f"{fast['Código']} combina en esta comparación el cobro más temprano con la mayor ganancia potencial.")
+    st.warning('**Prueba de criterio, no optimización financiera definitiva.** Los importes suponen vender toda la necesidad neta al precio del Excel; no se agregan al Cash Flow ni se consideran cobros confirmados. El botón Optimizar producción sigue maximizando ganancia, sin reinvertir estas cobranzas.')
+
 # ─── V11 · PLAN DE PRODUCCIÓN ORIENTADO A RENTABILIDAD ───
 with main_plan:
     from optimizer_cc import optimize_batches
@@ -1269,7 +1375,16 @@ with main_plan:
                     mapped.append({'codigo':code,'descripcion':str(item.DESCRIPCION),'demanda_neta':float(item['NECESIDAD NETA']),
                         'rendimiento':float(formula['rendimiento_bejerman'])/units_per_bulto,
                         'costo_bulto':float(cost_row['COSTO POR BULTO']),'precio_bulto':float(cost_row['PRECIO POR BULTO'])})
-                st.subheader('2. Presupuesto para fabricar')
+                try:
+                    historical_cf = read_historical(history_file) if history_file is not None else pd.DataFrame()
+                    historical_routes, _ = load_routes()
+                    client_profiles = cc_payment_profiles(historical_routes, historical_cf)
+                    if not client_profiles:
+                        st.info('No hay condiciones históricas utilizables. Guardá una hoja de ruta o subí el Cash Flow y usá plazos confirmados en esta prueba.')
+                    cc_liquidity_scenario(mapped, client_profiles, reference_date)
+                except Exception as exc:
+                    st.warning('No pude preparar la prueba de condiciones de pago: ' + str(exc))
+                st.subheader('3. Presupuesto para fabricar')
                 financial_budget=0.
                 if 'analysis' in st.session_state:
                     fc,_,cc,rr,hh,res,start=st.session_state['analysis']
@@ -1295,7 +1410,7 @@ with main_plan:
                         st.session_state['v11_result']=(plan_result,issues,summary,net_budget,source_date,len(mapped),sum(float(x['demanda_neta']) for x in mapped))
                     if 'v11_result' in st.session_state:
                         plan_result,issues,summary,used_budget,used_date,mapped_count,mapped_demand=st.session_state['v11_result']
-                        st.subheader('3. Recomendación más rentable')
+                        st.subheader('4. Recomendación más rentable')
                         st.caption(f'Resultado calculado con presupuesto {money(used_budget)} y distribución {used_date}. Presioná Optimizar nuevamente si modificás entradas.')
                         a,b,c,d=st.columns(4)
                         a.metric('Elaboraciones',str(summary.get('selected_batches',0)))
